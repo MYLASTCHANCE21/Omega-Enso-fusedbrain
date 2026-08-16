@@ -1,20 +1,16 @@
 """
 ======================================================================
-Ω-FRAMEWORK ENSO — COMPLETE UNIFIED PRODUCTION SUITE
+Ω‑FRAMEWORK ENSO — COMPLETE UNIFIED SUITE (v1.6)
 ======================================================================
-A self‑contained, live‑data‑driven ENSO early warning and forecasting system.
-
-Features:
-- 6‑D Ω‑Box model with exact Jin embedding and logarithmic gauge.
-- Recursive bifurcation edge refinement (finds σ=0.5567, λ=0.2656).
-- Arnold tongue (phase‑locking) mapping.
-- Lyapunov exponent analysis (chaos detection).
-- Thermodynamic diagnostics (energy, entropy).
-- Live NOAA data ingestion (OISST v2.1, OLR CDR).
-- Historical replay (1997 Super El Niño).
-- Real‑time 2026 early warning monitor.
-- Automated forecast runs with JSON archiving.
-- Plug‑and‑play: runs on any machine with Python + NumPy/SciPy/Matplotlib.
+Includes:
+  • 6D Ω‑Box model with gauge field, memory, phase
+  • Full diagnostics (coherence, SNR, Lyapunov, Arnold tongue)
+  • NOAA data ingestion (OISST/OLR with mock fallback)
+  • Live 2026 bifurcation monitor (fixed and adaptive)
+  • 1997 Super El Niño replay
+  • Windy.com export (GeoJSON, KML, CSV, interactive HTML)
+  • Evolutionary meta‑learning (self‑tuning of σ, λ, τ_amp, τ_coupling)
+  • Adaptive bifurcation surface (state‑dependent thresholds)
 
 Author: (Your name)
 Date: 2026
@@ -32,6 +28,8 @@ import os
 import json
 import io
 import urllib.request
+import warnings
+from copy import deepcopy
 
 # =====================================================================
 # OPTIONAL IMPORTS (GRACEFUL FALLBACK)
@@ -53,17 +51,23 @@ except ImportError:
     HAS_S3_LIBS = False
 
 # =====================================================================
+# 0. CONSTANTS & CONFIGURATION
+# =====================================================================
+BISTABILITY_THRESHOLD: float = 0.4
+STATE_CLIP_BOUNDS: Tuple[float, float] = (-10.0, 10.0)
+PSI_CLIP_BOUNDS: Tuple[float, float] = (-20.0, 20.0)
+
+# =====================================================================
 # 1. PARAMETERS & TYPES
 # =====================================================================
 @dataclass
 class OmegaParameters:
-    """All parameters for the Ω‑Box model."""
     beta: float = 1.50
     alpha0: float = 0.03
     alpha1: float = 0.80
     alpha2: float = 1.00
-    sigma: float = 1.00
-    lam: float = 0.30
+    sigma: float = 0.85
+    lam: float = 0.45
     c: float = 0.40
     d: float = 0.30
     kappa: float = 0.05
@@ -84,13 +88,15 @@ class OmegaParameters:
     noise_type: str = "gaussian"
     student_df: float = 3.0
     mult_strength: float = 0.5
+    tau_amp: float = 0.15
+    tau_coupling: float = 0.25
+    wind_noise: float = 0.03
 
     def copy(self) -> "OmegaParameters":
         return OmegaParameters(**asdict(self))
 
 @dataclass
 class BistableZone:
-    """Characterized boundary parameters for a valid region of bistability."""
     id: int
     sigma_min: float
     sigma_max: float
@@ -100,24 +106,38 @@ class BistableZone:
     avg_switches: float
     num_points: int
 
+@dataclass
+class MetaLearningState:
+    generation: int = 0
+    best_params: Optional[OmegaParameters] = None
+    best_score: float = float('inf')
+    population: List[OmegaParameters] = None
+    scores_history: List[float] = None
+    param_history: List[Dict[str, float]] = None
+    data_source: str = "unknown"
+
+    def __post_init__(self):
+        if self.population is None:
+            self.population = []
+        if self.scores_history is None:
+            self.scores_history = []
+        if self.param_history is None:
+            self.param_history = []
+
 # =====================================================================
 # 2. Ω‑BOX MODEL
 # =====================================================================
 class OmegaBoxModel:
-    """
-    Exact Jin embedding with a logarithmic gauge.
-    When ψ ≡ 0 (g ≡ 1), J ≡ 0, θ ≡ 0 and α_T = α₀,
-    the φ–z subsystem is identical to the classical Jin oscillator.
-    """
     def __init__(self, params: Optional[OmegaParameters] = None, seed: int = 42):
         self.p = params or OmegaParameters()
         self.rng: Generator = default_rng(seed)
-        self.state = np.zeros(6)          # [φ, z, p, ψ, J, θ]
+        self.state = np.zeros(6)
         self.time = 0.0
         self.energy_history: List[float] = []
+        self._wind_history: List[float] = []
 
     def _g(self, ψ: float) -> float:
-        ψ = np.clip(ψ, -20.0, 20.0)
+        ψ = np.clip(ψ, PSI_CLIP_BOUNDS[0], PSI_CLIP_BOUNDS[1])
         return float(np.exp(ψ))
 
     def _noise_increment(self, dt: float, φ: float) -> Tuple[float, float, float]:
@@ -144,18 +164,14 @@ class OmegaBoxModel:
         φ = np.clip(state[0], -5.0, 5.0)
         z = np.clip(state[1], -5.0, 5.0)
         p = np.clip(state[2], -5.0, 5.0)
-        ψ = np.clip(state[3], -20.0, 20.0)
+        ψ = np.clip(state[3], PSI_CLIP_BOUNDS[0], PSI_CLIP_BOUNDS[1])
         J = np.clip(state[4], -5.0, 5.0)
         θ = np.clip(state[5], -5.0, 5.0)
-
         par = self.p
         g = self._g(ψ)
         alpha_T = par.alpha0 + par.kappa * (g + 1.0/g) + par.nu * J
         forcing = par.A_force * np.sin(2 * np.pi * t / par.T_force)
-
-        dφ = (-alpha_T*φ - par.beta*φ**3
-              + par.alpha1*p + par.alpha2*z
-              + par.chi*J*φ + forcing)
+        dφ = (-alpha_T*φ - par.beta*φ**3 + par.alpha1*p + par.alpha2*z + par.chi*J*φ + forcing)
         dz = -par.c*φ - par.d*z
         dp = -par.lam*p + par.sigma*φ
         dg = par.beta_g*(1.0 - g) + par.gamma*φ
@@ -172,14 +188,12 @@ class OmegaBoxModel:
         k3 = self.rhs(s + 0.5*dt*k2, t + 0.5*dt)
         k4 = self.rhs(s + dt*k3, t + dt)
         self.state = s + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-
-        self.state[0] = np.clip(self.state[0], -10.0, 10.0)
-        self.state[1] = np.clip(self.state[1], -10.0, 10.0)
-        self.state[2] = np.clip(self.state[2], -10.0, 10.0)
-        self.state[3] = np.clip(self.state[3], -20.0, 20.0)
-        self.state[4] = np.clip(self.state[4], -10.0, 10.0)
-        self.state[5] = np.clip(self.state[5], -10.0, 10.0)
-
+        self.state[0] = np.clip(self.state[0], STATE_CLIP_BOUNDS[0], STATE_CLIP_BOUNDS[1])
+        self.state[1] = np.clip(self.state[1], STATE_CLIP_BOUNDS[0], STATE_CLIP_BOUNDS[1])
+        self.state[2] = np.clip(self.state[2], STATE_CLIP_BOUNDS[0], STATE_CLIP_BOUNDS[1])
+        self.state[3] = np.clip(self.state[3], PSI_CLIP_BOUNDS[0], PSI_CLIP_BOUNDS[1])
+        self.state[4] = np.clip(self.state[4], STATE_CLIP_BOUNDS[0], STATE_CLIP_BOUNDS[1])
+        self.state[5] = np.clip(self.state[5], STATE_CLIP_BOUNDS[0], STATE_CLIP_BOUNDS[1])
         if stochastic:
             nφ, np_, nθ = self._noise_increment(dt, self.state[0])
             self.state[0] += nφ
@@ -187,6 +201,18 @@ class OmegaBoxModel:
             self.state[5] += nθ
         self.time += dt
         self.energy_history.append(self.energy())
+        tau = self._compute_wind_tau()
+        self._wind_history.append(tau)
+
+    def _compute_wind_tau(self) -> float:
+        φ = self.state[0]
+        p = self.state[2]
+        par = self.p
+        noise = par.wind_noise * self.rng.normal() if par.wind_noise > 0 else 0.0
+        return par.tau_amp * φ + par.tau_coupling * p + noise
+
+    def get_wind_series(self) -> np.ndarray:
+        return np.array(self._wind_history)
 
     def integrate(self, n_steps: int = 2000, dt: float = 0.1,
                   stochastic: bool = True, init: Optional[np.ndarray] = None) -> np.ndarray:
@@ -197,6 +223,7 @@ class OmegaBoxModel:
         traj = np.zeros((n_steps+1, 6))
         traj[0] = self.state.copy()
         self.energy_history = [self.energy()]
+        self._wind_history = []
         for i in range(n_steps):
             self.step_rk4(dt, stochastic=stochastic)
             traj[i+1] = self.state.copy()
@@ -211,7 +238,7 @@ class OmegaBoxModel:
 
     def set_state(self, state: np.ndarray) -> None:
         self.state = np.asarray(state, dtype=float).copy()
-        self.state[3] = np.clip(self.state[3], -20.0, 20.0)
+        self.state[3] = np.clip(self.state[3], PSI_CLIP_BOUNDS[0], PSI_CLIP_BOUNDS[1])
 
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
@@ -219,12 +246,12 @@ class OmegaBoxModel:
         self.state[:] = 0.0
         self.time = 0.0
         self.energy_history.clear()
+        self._wind_history.clear()
 
 # =====================================================================
 # 3. CLASSICAL JIN (for validation)
 # =====================================================================
 class JinOscillator:
-    """Exact Jin (1997) recharge oscillator."""
     def __init__(self, params: Optional[OmegaParameters] = None, seed: int = 42):
         p = params or OmegaParameters()
         self.alpha_T = p.alpha0
@@ -255,8 +282,7 @@ class JinOscillator:
     def rhs(self, state: np.ndarray, t: float = 0.0) -> np.ndarray:
         φ, z = state
         forcing = self.A_force * np.sin(2*np.pi*t / self.T_force)
-        return np.array([-self.alpha_T*φ + self.alpha2*z + forcing,
-                         -self.c*φ - self.d*z])
+        return np.array([-self.alpha_T*φ + self.alpha2*z + forcing, -self.c*φ - self.d*z])
 
     def step_rk4(self, dt: float, stochastic: bool = True) -> None:
         t = self.time
@@ -287,14 +313,14 @@ class JinOscillator:
 # =====================================================================
 # 4. DIAGNOSTICS
 # =====================================================================
-def residence_times(phi: np.ndarray, threshold: float = 0.4) -> np.ndarray:
+def residence_times(phi: np.ndarray, threshold: float = BISTABILITY_THRESHOLD) -> np.ndarray:
     above = phi > threshold
     switches = np.where(np.diff(above.astype(int)))[0]
     if len(switches) < 2:
         return np.array([])
     return np.diff(switches)
 
-def coherence_metrics(phi: np.ndarray, dt: float, threshold: float = 0.4) -> Dict:
+def coherence_metrics(phi: np.ndarray, dt: float, threshold: float = BISTABILITY_THRESHOLD) -> Dict:
     rt = residence_times(phi, threshold)
     if len(rt) < 2:
         return {"mean_rt": np.nan, "cv_rt": np.nan, "n_switches": 0}
@@ -314,8 +340,9 @@ def snr_proxy(phi: np.ndarray, dt: float, T_force: float = 48.0) -> float:
 def compute_framework_energy_stability(trajectory_matrix: np.ndarray, params: OmegaParameters, return_raw: bool = False) -> dict:
     phi_states = trajectory_matrix[:, 0]
     z_states = trajectory_matrix[:, 1]
+    beta_safe = params.beta if params.beta != 0.0 else 1.0
     potential_energy = 0.25 * (phi_states**4) - 0.5 * (phi_states**2)
-    kinetic_energy = 0.5 * (z_states**2) / (params.beta if params.beta != 0.0 else 1.0)
+    kinetic_energy = 0.5 * (z_states**2) / beta_safe
     total_energy = potential_energy + kinetic_energy
     metrics = {"mean_energy": float(np.mean(total_energy)), "std_energy": float(np.std(total_energy))}
     if return_raw:
@@ -323,22 +350,27 @@ def compute_framework_energy_stability(trajectory_matrix: np.ndarray, params: Om
     return metrics
 
 def compute_entropy_generation(trajectory_matrix: np.ndarray, params: OmegaParameters, dt: float) -> np.ndarray:
+    if dt <= 0:
+        raise ValueError(f"dt must be positive, got {dt}")
     phi_states = trajectory_matrix[:, 0]
     z_states = trajectory_matrix[:, 1]
     p_states = trajectory_matrix[:, 2]
     damping_dissipation_p = params.lam * p_states**2
     damping_dissipation_z = params.d * z_states**2
-    entropy_gen_rate = (damping_dissipation_p + damping_dissipation_z + params.eta_std**2 + params.xi_std**2 + params.theta_std**2) / dt
+    noise_power = params.eta_std**2 + params.xi_std**2 + params.theta_std**2
+    entropy_gen_rate = (damping_dissipation_p + damping_dissipation_z + noise_power) / dt
     return entropy_gen_rate
 
 def compute_framework_thermodynamics(trajectory_matrix: np.ndarray, params: OmegaParameters, dt: float) -> dict:
     phi = trajectory_matrix[:, 0]
     z = trajectory_matrix[:, 1]
+    beta_safe = params.beta if params.beta != 0.0 else 1.0
     potential_energy = 0.25 * (phi**4) - 0.5 * (phi**2)
-    kinetic_energy = 0.5 * (z**2) / (params.beta if params.beta != 0.0 else 1.0)
+    kinetic_energy = 0.5 * (z**2) / beta_safe
     total_energy = potential_energy + kinetic_energy
     dphi = np.diff(phi) / dt
-    entropy_gen = (dphi**2) * (params.lam if params.lam != 0.0 else 1.0)
+    lam_safe = params.lam if params.lam != 0.0 else 1.0
+    entropy_gen = (dphi**2) * lam_safe
     phi_clipped = phi[:-1]
     pos_mask = phi_clipped > 0.0
     neg_mask = phi_clipped < 0.0
@@ -352,7 +384,7 @@ def compute_framework_thermodynamics(trajectory_matrix: np.ndarray, params: Omeg
     }
 
 # =====================================================================
-# 5. PHASE‑LOCKING (ARNOLD TONGUE)
+# 5. PHASE-LOCKING (ARNOLD TONGUE)
 # =====================================================================
 def analyze_arnold_tongue_locking(trajectory_matrix: np.ndarray, forcing_phase_array: np.ndarray) -> Dict:
     phi_states = trajectory_matrix[:, 0]
@@ -371,37 +403,22 @@ def analyze_arnold_tongue_locking(trajectory_matrix: np.ndarray, forcing_phase_a
         "is_locked": bool(R_vector_length > 0.85 and circ_std_deg < 30.0),
     }
 
-def perform_phase_locking_sweep(
-    initial_params: OmegaParameters,
-    sigma_fixed: float,
-    lam_fixed: float,
-    a_force_range: np.ndarray,
-    t_force_range: np.ndarray,
-    n_steps_sim: int = 50000,
-    dt_sim: float = 0.1,
-    transient_sim: int = 2000,
-    seed_sim: int = 42
-) -> Dict:
+def perform_phase_locking_sweep(initial_params: OmegaParameters, sigma_fixed: float, lam_fixed: float,
+                                a_force_range: np.ndarray, t_force_range: np.ndarray,
+                                n_steps_sim: int = 50000, dt_sim: float = 0.1,
+                                transient_sim: int = 2000, seed_sim: int = 42) -> Dict:
     r_coherence_matrix = np.zeros((len(a_force_range), len(t_force_range)))
     circ_std_dev_matrix = np.zeros((len(a_force_range), len(t_force_range)))
     is_locked_matrix = np.full((len(a_force_range), len(t_force_range)), False, dtype=bool)
-
     print("\n--- Performing Phase-Locking Parameter Sweep ---")
     for i, current_a_force in enumerate(a_force_range):
         print(f"  Sweeping A_force = {current_a_force:.4f}...")
         for j, current_t_force in enumerate(t_force_range):
-            current_params = replace(
-                initial_params,
-                sigma=sigma_fixed,
-                lam=lam_fixed,
-                A_force=current_a_force,
-                T_force=current_t_force
-            )
+            current_params = replace(initial_params, sigma=sigma_fixed, lam=lam_fixed,
+                                     A_force=current_a_force, T_force=current_t_force)
             model = OmegaBoxModel(params=current_params, seed=seed_sim)
             traj = model.integrate(n_steps=n_steps_sim, dt=dt_sim, stochastic=True)
             raw_phi = traj[transient_sim:, 0]
-
-            # Filter
             if HAS_SCIPY:
                 nyq = 0.5 * (1.0 / dt_sim)
                 cutoff_freq = 0.15
@@ -409,16 +426,13 @@ def perform_phase_locking_sweep(
                 filtered_phi = filtfilt(b, a, raw_phi)
             else:
                 filtered_phi = np.convolve(raw_phi, np.ones(5)/5, mode='same')
-
             time_axis_filtered = np.arange(len(filtered_phi)) * dt_sim
             forcing_phase = (2 * np.pi * time_axis_filtered / current_t_force) % (2 * np.pi)
             dummy_steady_state_traj = np.column_stack((filtered_phi, np.zeros_like(filtered_phi)))
             arnold_results = analyze_arnold_tongue_locking(dummy_steady_state_traj, forcing_phase)
-
             r_coherence_matrix[i, j] = arnold_results["synchronization_coherence_R"]
             circ_std_dev_matrix[i, j] = arnold_results["circular_std_dev_deg"]
             is_locked_matrix[i, j] = arnold_results["is_locked"]
-
     return {
         "r_coherence_matrix": r_coherence_matrix,
         "circ_std_dev_matrix": circ_std_dev_matrix,
@@ -430,7 +444,6 @@ def perform_phase_locking_sweep(
 def execute_extended_locking_sweep(initial_params: OmegaParameters,
                                    min_amplitude: float = 0.10,
                                    max_amplitude: float = 0.60) -> Optional[float]:
-    """Sweep A_force upward to find the first locking amplitude."""
     print("\n--- Initiating Escalated Phase-Locking Parameter Sweep ---")
     escalated_amplitudes = np.linspace(min_amplitude, max_amplitude, 11)
     if initial_params.T_force > 0:
@@ -467,12 +480,10 @@ def compute_lyapunov_exponent_with_history(model_params: OmegaParameters,
     initial_state_perturbed[0] += perturbation
     model_pert = OmegaBoxModel(params=model_params.copy(), seed=42)
     model_pert.set_state(initial_state_perturbed.copy())
-
     sum_log_divergence = 0.0
     num_normalizations = 0
     log_divergence_history = []
     cumulative_le_history = []
-
     for i in range(1, num_steps + 1):
         model_ref.step_rk4(dt, stochastic=False)
         model_pert.step_rk4(dt, stochastic=False)
@@ -491,7 +502,6 @@ def compute_lyapunov_exponent_with_history(model_params: OmegaParameters,
                 model_pert.state = model_ref.state + direction * perturbation
             else:
                 model_pert.state = model_ref.state + default_rng(seed=i).normal(size=initial_state.shape) * perturbation
-
     if num_normalizations == 0:
         return np.nan, [], []
     lyapunov_exponent = sum_log_divergence / (num_normalizations * normalization_interval * dt)
@@ -545,13 +555,12 @@ def refine_bifurcation_search_recursive(
     max_iterations: int = 10
 ) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
     iteration = 0
+    valid_pairs_in_grid = []
     while (max(current_sigma_range) - min(current_sigma_range) > precision_threshold or
            max(current_lam_range) - min(current_lam_range) > precision_threshold) and \
           iteration < max_iterations:
         print(f"Iteration {iteration + 1}: Refining Sigma [{min(current_sigma_range):.4f}, {max(current_sigma_range):.4f}], "
               f"Lambda [{min(current_lam_range):.4f}, {max(current_lam_range):.4f}]")
-        cv_matrix = np.zeros((len(current_sigma_range), len(current_lam_range)))
-        switches_matrix = np.zeros((len(current_sigma_range), len(current_lam_range)))
         valid_pairs_in_grid = []
         for i, c_sig in enumerate(current_sigma_range):
             for j, c_lam in enumerate(current_lam_range):
@@ -576,7 +585,6 @@ def refine_bifurcation_search_recursive(
         current_sigma_range = np.linspace(new_sigma_min, new_sigma_max, len(current_sigma_range))
         current_lam_range = np.linspace(new_lam_min, new_lam_max, len(current_lam_range))
         iteration += 1
-
     print(f"Refinement complete after {iteration} iterations.")
     if valid_pairs_in_grid:
         final_sigma_entry = min(valid_pairs_in_grid, key=lambda x: x[0])
@@ -606,11 +614,9 @@ def identify_and_characterize_bistable_zones(
             met = coherence_metrics(phi, dt_sim, threshold=threshold_sim)
             cv_matrix[i, j] = met["cv_rt"]
             switches_matrix[i, j] = met["n_switches"]
-    # Identify bistable points
     bistable_indices = np.where(~np.isnan(cv_matrix) & (switches_matrix > 0))
     if bistable_indices[0].size == 0:
         return []
-    # Treat all as one zone (could be refined later)
     zone = BistableZone(
         id=1,
         sigma_min=float(np.min(sigma_range[bistable_indices[0]])),
@@ -659,22 +665,17 @@ def generate_synthetic_noaa_backup(reason: str) -> dict:
     }
 
 def extract_enso_regional_metrics(target_date: Optional[datetime] = None) -> dict:
-    """Streams data securely via exact public buckets to handle unsigned permissions."""
     if not HAS_S3_LIBS:
         return generate_synthetic_noaa_backup("boto3 or xarray missing.")
-
     aws_config = Config(signature_version=UNSIGNED, region_name="us-east-1", retries={'max_attempts': 1})
     s3 = boto3.client('s3', config=aws_config)
     metrics = {"sst_anomaly_variance": 1.0, "atmosphere_damping_scale": 1.0}
     live_ocean = live_atmos = False
-
     if target_date is None:
         target_date = datetime.now() - timedelta(days=4)
     year = target_date.strftime("%Y")
     month = target_date.strftime("%m")
     day = target_date.strftime("%d")
-
-    # Ocean Stream: noaa-oisst-pds
     try:
         ocean_bucket = "noaa-oisst-pds"
         ocean_key = f"oisst/v2.1/AVHRR/{year}{month}/oisst-avhrr-v02r01.{year}{month}{day}.nc"
@@ -684,10 +685,8 @@ def extract_enso_regional_metrics(target_date: Optional[datetime] = None) -> dic
             metrics["sst_anomaly_variance"] = float(nino34_sst.var().values)
             live_ocean = True
             print(f" -> [OISST] Pulled data for {year}-{month}-{day}")
-    except Exception:
-        pass
-
-    # Atmospheric Stream: noaa-cdr-atmospheric-pds
+    except Exception as e:
+        warnings.warn(f"OISST fetch failed: {type(e).__name__}: {e}")
     try:
         atmos_bucket = "noaa-cdr-atmospheric-pds"
         atmos_key = f"olr/v01r02/daily/{year}/olr-daily_v01r02_19790101_{year}{month}{day}.nc"
@@ -701,9 +700,8 @@ def extract_enso_regional_metrics(target_date: Optional[datetime] = None) -> dic
             metrics["atmosphere_damping_scale"] = float(nino34_olr.mean().values) / 240.0
             live_atmos = True
             print(f" -> [OLR] Pulled data for {year}-{month}-{day}")
-    except Exception:
-        pass
-
+    except Exception as e:
+        warnings.warn(f"OLR fetch failed: {type(e).__name__}: {e}")
     if not (live_ocean and live_atmos):
         return generate_synthetic_noaa_backup("Direct keys missing or target limits unarchived.")
     return metrics
@@ -748,11 +746,9 @@ def apply_rg_scaling(params: OmegaParameters, ln_l_final: float, num_rg_steps: i
         Tr_HPP = new_params.lam
         Tr_L12L12 = new_params.alpha2
         eta_val = new_params.eta_std
-
         beta_sigma = - (current_sigma**2) / (16 * np.pi**2) + g_rg_coeff * (Tr_Hgg + current_gamma * Tr_HPP)
         beta_gamma = (current_gamma**2 * current_sigma) / (8 * np.pi**2) * Tr_L12L12 - eta_val * current_gamma
         beta_lam = -current_lam * Tr_L12L12 * 0.1
-
         new_params.sigma = max(new_params.sigma + beta_sigma * d_ln_l_step, 1e-6)
         new_params.gamma += beta_gamma * d_ln_l_step
         new_params.lam += beta_lam * d_ln_l_step
@@ -771,11 +767,9 @@ def validate_invariance(n_steps: int = 500, dt: float = 0.1) -> bool:
     omega_model = OmegaBoxModel(params=p, seed=42)
     init_box = np.array([0.5, -3.0, 0.0, 0.0, 0.0, 0.0])
     traj_omega = omega_model.integrate(n_steps=n_steps, dt=dt, stochastic=False, init=init_box)
-
     jin_model = JinOscillator(params=p, seed=42)
     init_jin = np.array([0.5, -3.0])
     traj_jin = jin_model.integrate(n_steps=n_steps, dt=dt, stochastic=False, init=init_jin)
-
     diff_phi = np.max(np.abs(traj_omega[:, 0] - traj_jin[:, 0]))
     diff_z = np.max(np.abs(traj_omega[:, 1] - traj_jin[:, 1]))
     max_diff = max(diff_phi, diff_z)
@@ -798,7 +792,7 @@ def explore_gauge_effects(n_steps: int = 1500, dt: float = 0.1, seed: int = 123)
         traj = model.integrate(n_steps=n_steps, dt=dt, stochastic=True)
         φ = traj[:, 0]
         g = np.exp(np.clip(traj[:, 3], -20, 20))
-        met = coherence_metrics(φ, dt, threshold=0.0)
+        met = coherence_metrics(φ, dt, threshold=BISTABILITY_THRESHOLD)
         results[name] = {"phi": φ, "g": g, "metrics": met}
         cv_str = f"{met['cv_rt']:.3f}" if not np.isnan(met['cv_rt']) else "nan"
         rt_str = f"{met['mean_rt']:.1f}" if not np.isnan(met['mean_rt']) else "nan"
@@ -820,7 +814,7 @@ def explore_non_gaussian_noise(n_steps: int = 2000, dt: float = 0.1, seed: int =
         traj = model.integrate(n_steps=n_steps, dt=dt, stochastic=True)
         phi_series = traj[:, 0]
         snr = snr_proxy(phi_series, dt, p.T_force)
-        met = coherence_metrics(phi_series, dt, threshold=0.0)
+        met = coherence_metrics(phi_series, dt, threshold=BISTABILITY_THRESHOLD)
         results[name] = {"phi": phi_series, "snr": snr, "metrics": met}
         cv_str = f"{met['cv_rt']:.3f}" if not np.isnan(met['cv_rt']) else "nan"
         rt_str = f"{met['mean_rt']:.1f}" if not np.isnan(met['mean_rt']) else "nan"
@@ -837,15 +831,13 @@ def explore_sr_coherence(noise_levels=None, n_steps=2000, dt=0.1, seed_base=42):
         p_om = replace(base, eta_std=float(eta), xi_std=eta*0.4, theta_std=eta*0.2)
         model = OmegaBoxModel(params=p_om, seed=seed_base+i)
         phi_om = model.integrate(n_steps=n_steps, dt=dt)[:, 0]
-        met_om = coherence_metrics(phi_om, dt, threshold=0.0)
+        met_om = coherence_metrics(phi_om, dt, threshold=BISTABILITY_THRESHOLD)
         snr_om = snr_proxy(phi_om, dt, base.T_force)
-
         p_jin = replace(base, eta_std=float(eta))
         jin = JinOscillator(params=p_jin, seed=seed_base+i)
         phi_jin = jin.integrate(n_steps=n_steps, dt=dt)[:, 0]
-        met_jin = coherence_metrics(phi_jin, dt, threshold=0.0)
+        met_jin = coherence_metrics(phi_jin, dt, threshold=BISTABILITY_THRESHOLD)
         snr_jin = snr_proxy(phi_jin, dt, base.T_force)
-
         results["noise"].append(eta)
         results["omega"].append({"snr": snr_om, **met_om})
         results["jin"].append({"snr": snr_jin, **met_jin})
@@ -861,42 +853,36 @@ def plot_all(gauge_res, noise_res, sr_res):
     except ImportError:
         print("matplotlib not available – skipping plots")
         return
-
     fig, axes = plt.subplots(2, 3, figsize=(15, 9))
     for name, data in gauge_res.items():
         axes[0,0].plot(data["phi"], label=name, alpha=0.8)
     axes[0,0].set_title("1. Gauge effects on φ")
     axes[0,0].legend(fontsize=8)
-
     for name, data in gauge_res.items():
         axes[0,1].plot(data["g"], label=name, alpha=0.8)
     axes[0,1].set_title("1. Metric g(t)")
     axes[0,1].legend(fontsize=8)
-
     for name, data in noise_res.items():
         axes[0,2].plot(data["phi"], label=name, alpha=0.8)
     axes[0,2].set_title("2. Non-Gaussian noise – φ")
     axes[0,2].legend(fontsize=8)
-
     noise = np.array(sr_res["noise"])
     axes[1,0].semilogx(noise, [r["snr"] for r in sr_res["omega"]], "o-", label="Ω")
     axes[1,0].semilogx(noise, [r["snr"] for r in sr_res["jin"]], "s--", label="Jin")
     axes[1,0].set_title("3. SNR (stochastic resonance)")
     axes[1,0].legend()
-
     axes[1,1].semilogx(noise, [r["cv_rt"] for r in sr_res["omega"]], "o-", label="Ω")
     axes[1,1].semilogx(noise, [r["cv_rt"] for r in sr_res["jin"]], "s--", label="Jin")
     axes[1,1].set_title("3. Residence-time CV (coherence)")
     axes[1,1].legend()
-
     model = OmegaBoxModel(seed=99)
     traj = model.integrate(n_steps=800, dt=0.1)
     E = 0.5*(traj[:,0]**2 + traj[:,1]**2 + traj[:,2]**2)
     axes[1,2].plot(E)
     axes[1,2].set_title("Energy (full Ω)")
-
     plt.suptitle("Ω-ENSO Framework Architecture Validation Plots Canvas", fontsize=13)
     plt.tight_layout()
+    plt.savefig('/mnt/agents/output/omega_validation_plots.png', dpi=150)
     plt.show()
 
 # =====================================================================
@@ -915,7 +901,6 @@ def export_clean_climate_array(filtered_phi: np.ndarray,
     return file_path
 
 def list_omega_names() -> List[str]:
-    """Returns the names of all core variables and procedures inside this workspace."""
     return [
         "OmegaParameters", "OmegaBoxModel", "JinOscillator", "BistableZone",
         "residence_times", "coherence_metrics", "snr_proxy", "compute_framework_energy_stability",
@@ -932,47 +917,113 @@ def list_omega_names() -> List[str]:
     ]
 
 # =====================================================================
-# 13. REAL-TIME 2026 EARLY WARNING MONITOR
+# 13. ADAPTIVE BIFURCATION SURFACE (NEW)
 # =====================================================================
-def execute_2026_live_bifurcation_monitor() -> dict:
-    print("\n" + "="*70)
-    print("INITIALIZING LIVE 2026 ENSO BIFURCATION EARLY WARNING MONITOR")
-    print("=" * 70)
+def compute_alpha_T_eff(alpha0: float, kappa: float, nu: float, psi: float, J: float) -> float:
+    g = np.exp(np.clip(psi, -20.0, 20.0))
+    return alpha0 + kappa * (g + 1.0 / g) + nu * J
 
+def compute_critical_sigma(lambda_val: float, alpha_T_eff: float,
+                           alpha1: float, alpha2: float, c: float, d: float) -> float:
+    denom = alpha1 * (alpha_T_eff + lambda_val)
+    if denom <= 1e-12:
+        return np.nan
+    t1 = alpha_T_eff * d + alpha_T_eff * lambda_val + d * lambda_val + alpha2 * c
+    t2 = alpha_T_eff + d + lambda_val
+    t3 = lambda_val * (alpha_T_eff * d + alpha2 * c)
+    return float((t1 * t2 - t3) / denom)
+
+def compute_critical_lambda(sigma_val: float, alpha_T_eff: float,
+                            alpha1: float, alpha2: float, c: float, d: float,
+                            lam_search: Tuple[float, float] = (0.01, 2.0),
+                            n_grid: int = 4000) -> float:
+    lam_grid = np.linspace(lam_search[0], lam_search[1], n_grid)
+    sig_grid = np.array([compute_critical_sigma(l, alpha_T_eff, alpha1, alpha2, c, d)
+                         for l in lam_grid])
+    valid = ~np.isnan(sig_grid)
+    if not np.any(valid):
+        return np.nan
+    lam_v, sig_v = lam_grid[valid], sig_grid[valid]
+    diff = sig_v - sigma_val
+    if np.all(diff > 0):
+        return float(lam_v[-1])
+    if np.all(diff < 0):
+        return float(lam_v[0])
+    idx = np.where(np.diff(np.sign(diff)))[0]
+    if len(idx) == 0:
+        return float(lam_v[np.argmin(np.abs(diff))])
+    i = idx[0]
+    frac = (sigma_val - sig_v[i]) / (sig_v[i+1] - sig_v[i] + 1e-12)
+    return float(lam_v[i] + frac * (lam_v[i+1] - lam_v[i]))
+
+def bifurcation_distance(state: np.ndarray, params: OmegaParameters) -> Dict[str, float]:
+    phi, z, p, psi, J, theta = state
+    alpha_T_eff = compute_alpha_T_eff(params.alpha0, params.kappa, params.nu, psi, J)
+    sigma_crit = compute_critical_sigma(params.lam, alpha_T_eff,
+                                        params.alpha1, params.alpha2, params.c, params.d)
+    lambda_crit = compute_critical_lambda(params.sigma, alpha_T_eff,
+                                          params.alpha1, params.alpha2, params.c, params.d)
+    d_sigma = params.sigma - sigma_crit
+    d_lambda = params.lam - lambda_crit
+    return {
+        "alpha_T_eff": float(alpha_T_eff),
+        "sigma_crit": float(sigma_crit),
+        "lambda_crit": float(lambda_crit),
+        "d_sigma": float(d_sigma),
+        "d_lambda": float(d_lambda),
+        "frac_sigma": float(d_sigma / max(abs(sigma_crit), 1e-6)),
+        "frac_lambda": float(d_lambda / max(abs(lambda_crit), 1e-6)),
+        "is_unstable_linear": bool(d_sigma > 0 and d_lambda > 0),
+    }
+
+def execute_adaptive_2026_monitor(model: OmegaBoxModel,
+                                  noaa_summary: Optional[Dict] = None) -> Dict:
     current_date = datetime.now()
     live_metrics = extract_enso_regional_metrics(target_date=current_date)
-
     active_sigma = 0.5567 * live_metrics["sst_anomaly_variance"]
     active_lambda = 0.2656 * live_metrics["atmosphere_damping_scale"]
-
-    cpc_bulletin = fetch_current_enso_state()
-    observed_phase = cpc_bulletin.get("observed_phase", "ENSO-Neutral")
-
-    print("\n" + "-"*50 + "\n2026 CLIMATE ACCELERATION TRACK PROFILE:\n" + "-"*50)
-    print(f"  Current Date Reference:  {current_date.strftime('%Y-%m-%d')}")
-    print(f"  NOAA Official Phase:     {observed_phase}")
-    print(f"  Calculated Active Sigma:  {active_sigma:.4f}  (Bifurcation Target: >= 0.80)")
-    print(f"  Calculated Active Lambda: {active_lambda:.4f}  (Bifurcation Target: >= 0.41)")
-    print("-" * 50)
-
-    is_critical = active_sigma >= 0.80 and active_lambda >= 0.41
-
-    if is_critical:
-        print("\n[🚨 SYSTEM ALERT: CRITICAL BIFURCATION CROSSING DETECTED]")
-        alert_status = "CRITICAL_BIFURCATION_ZONE"
-    elif active_sigma >= 0.70 or active_lambda >= 0.35:
-        print("\n[⚠️ SYSTEM WARNING: ELEVATED ANOMALY SCALING INDICATED]")
-        alert_status = "ELEVATED_PRE_BIFURCATION_STATE"
+    if noaa_summary is None:
+        noaa_summary = fetch_current_enso_state()
+    observed_phase = noaa_summary.get("observed_phase", "ENSO-Neutral")
+    update_live_state(model, noaa_summary)
+    model.p.sigma = active_sigma
+    model.p.lam = active_lambda
+    dist = bifurcation_distance(model.state, model.p)
+    f_sig, f_lam = dist["frac_sigma"], dist["frac_lambda"]
+    max_frac = max(f_sig, f_lam)
+    if max_frac > 0.15:
+        alert_status, emoji = "CRITICAL_BIFURCATION_ZONE", "🚨"
+    elif max_frac > 0.05:
+        alert_status, emoji = "ELEVATED_PRE_BIFURCATION_STATE", "⚠️"
     else:
-        print("\n[✅ SYSTEM STATUS: STABLE ORBIT NOMINAL]")
-        alert_status = "NOMINAL_STABLE_LIMIT_CYCLE"
+        alert_status, emoji = "NOMINAL_STABLE_LIMIT_CYCLE", "✅"
 
+    print("\n" + "=" * 70)
+    print("ADAPTIVE 2026 ENSO BIFURCATION EARLY WARNING MONITOR")
+    print("=" * 70)
+    print(f"  Date:      {current_date.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  NOAA:      {observed_phase}")
+    print(f"  Active σ:  {active_sigma:.4f}   |   Active λ:  {active_lambda:.4f}")
+    print("-" * 70)
+    print(f"  α_T^eff:   {dist['alpha_T_eff']:.4f}")
+    print(f"  σ_crit:    {dist['sigma_crit']:.4f}   |   λ_crit:    {dist['lambda_crit']:.4f}")
+    print(f"  d_σ:       {dist['d_sigma']:+.4f} ({f_sig:+.1%})")
+    print(f"  d_λ:       {dist['d_lambda']:+.4f} ({f_lam:+.1%})")
+    print("-" * 70)
+    print(f"\n[{emoji} {alert_status}]")
+    print("=" * 70)
     return {
         "timestamp": str(current_date),
         "alert_status": alert_status,
         "active_sigma": active_sigma,
         "active_lambda": active_lambda,
-        "noaa_phase": observed_phase
+        "noaa_phase": observed_phase,
+        "adaptive_thresholds": {"sigma_crit": dist["sigma_crit"],
+                                "lambda_crit": dist["lambda_crit"],
+                                "alpha_T_eff": dist["alpha_T_eff"]},
+        "distances": {"d_sigma": dist["d_sigma"], "d_lambda": dist["d_lambda"],
+                      "frac_sigma": dist["frac_sigma"], "frac_lambda": dist["frac_lambda"]},
+        "is_unstable_linear": dist["is_unstable_linear"],
     }
 
 # =====================================================================
@@ -982,31 +1033,24 @@ def compile_historical_event_timeline(start_year: int, start_month: int, duratio
     print(f"\n======================================================================")
     print(f"INITIATING HISTORICAL PROGRESSION LOOP FOR YEAR: {start_year}")
     print(f"======================================================================")
-
     timeline_records = {
         "dates": [],
         "sigma_scalers": [],
         "lambda_scalers": []
     }
-
     current_year = start_year
     current_month = start_month
-
     for step in range(duration_months):
         target_date = datetime(current_year, current_month, 15)
         date_str = target_date.strftime("%Y-%m")
-
         metrics = extract_enso_regional_metrics(target_date=target_date)
-
         timeline_records["dates"].append(date_str)
         timeline_records["sigma_scalers"].append(metrics["sst_anomaly_variance"])
         timeline_records["lambda_scalers"].append(metrics["atmosphere_damping_scale"])
-
         current_month += 1
         if current_month > 12:
             current_month = 1
             current_year += 1
-
     print("\n[Loop Complete] Historical progression matrix successfully compiled.")
     return timeline_records
 
@@ -1023,6 +1067,7 @@ def plot_historical_timeline(timeline_data: dict, event_name: str = "Historical 
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
+        plt.savefig('/mnt/agents/output/historical_timeline.png', dpi=150)
         plt.show()
     except Exception as e:
         print(f"Visualization bypassed: {e}")
@@ -1033,57 +1078,46 @@ def plot_historical_timeline(timeline_data: dict, event_name: str = "Historical 
 def run_integrated_omega_suite(initial_params: Optional[OmegaParameters] = None):
     if initial_params is None:
         initial_params = OmegaParameters()
-
     print("=" * 70)
     print("Ω-FRAMEWORK ENSO — INTEGRATED EXECUTION & BIFURCATION SUITE")
     print("=" * 70)
-
-    # 1. Explorations
     validate_invariance(n_steps=500, dt=0.1)
     gauge_res = explore_gauge_effects()
     noise_res = explore_non_gaussian_noise()
     sr_res = explore_sr_coherence()
     plot_all(gauge_res, noise_res, sr_res)
-
-    # 2. Parameter sweep for boundary thresholds
     print("\n--- Initializing Parameter Sweep Grid ---")
     sigma_range = np.linspace(0.5, 1.2, 8)
     lam_range = np.linspace(0.2, 0.8, 8)
     cv_matrix = np.zeros((8, 8))
     switches_matrix = np.zeros((8, 8))
-
     for i, sig in enumerate(sigma_range):
         for j, lam in enumerate(lam_range):
             p_test = replace(initial_params, sigma=sig, lam=lam, A_force=0.0)
             model_test = OmegaBoxModel(params=p_test, seed=42)
             traj_test = model_test.integrate(n_steps=400, dt=0.1, stochastic=True)
-            metrics = coherence_metrics(traj_test[100:, 0], dt=0.1, threshold=0.0)
+            metrics = coherence_metrics(traj_test[100:, 0], dt=0.1, threshold=BISTABILITY_THRESHOLD)
             cv_matrix[i, j] = metrics["cv_rt"]
             switches_matrix[i, j] = metrics["n_switches"]
-
-    # 3. Bifurcation edge selection
     valid_pairs = []
     for i, sig in enumerate(sigma_range):
         for j, lam in enumerate(lam_range):
             if not np.isnan(cv_matrix[i, j]) and switches_matrix[i, j] > 0:
                 valid_pairs.append((sig, lam))
-
     if valid_pairs:
         precise_sigma_entry = min(valid_pairs, key=lambda x: x[0])
         precise_lam_entry = min(valid_pairs, key=lambda x: x[1])
         print(f"\nFinal High-Precision Bifurcation Edge Found:")
-        print(f"  Sigma: {precise_sigma_entry[0]:.4f}, Lambda: {precise_sigma_entry[1]:.4f}")
-        target_sigma, target_lambda = precise_lam_entry[0], precise_lam_entry[1]
+        print(f"  Sigma: {precise_sigma_entry[0]:.4f}, Lambda: {precise_lam_entry[1]:.4f}")
+        target_sigma = precise_sigma_entry[0]
+        target_lambda = precise_lam_entry[1]
     else:
         print("\nNo clear bifurcation threshold found.")
         target_sigma, target_lambda = 0.80, 0.71
-
-    # 4. Long verification simulation
     print("\n--- Running Verification Simulation ---")
     n_steps_verify = 50000
     dt_verify = 0.1
     transient_verify = 2000
-
     optimal_params = OmegaParameters(
         beta=1.0, alpha0=0.05,
         sigma=target_sigma, lam=target_lambda,
@@ -1091,14 +1125,10 @@ def run_integrated_omega_suite(initial_params: Optional[OmegaParameters] = None)
         eta_std=0.05, xi_std=0.02, theta_std=0.01,
         A_force=0.0
     )
-
     verify_model = OmegaBoxModel(params=optimal_params, seed=42)
     verify_traj = verify_model.integrate(n_steps=n_steps_verify, dt=dt_verify, stochastic=True)
     raw_phi = verify_traj[transient_verify:, 0]
-
-    # Data assimilation synchronizer check
     update_live_state(verify_model, fetch_current_enso_state())
-
     print("\n--- Processing Signals: Eliminating Noise Rattle ---")
     if HAS_SCIPY:
         nyq_limit = 0.5 * (1.0 / dt_verify)
@@ -1106,10 +1136,8 @@ def run_integrated_omega_suite(initial_params: Optional[OmegaParameters] = None)
         filtered_phi = filtfilt(b, a, raw_phi)
     else:
         filtered_phi = np.convolve(raw_phi, np.ones(5)/5, mode='same')
-
-    verify_metrics = coherence_metrics(filtered_phi, dt_verify, threshold=0.0)
+    verify_metrics = coherence_metrics(filtered_phi, dt_verify, threshold=BISTABILITY_THRESHOLD)
     thermo = compute_framework_thermodynamics(verify_traj[transient_verify:], optimal_params, dt_verify)
-
     print(f"\nFiltered Verification Results:")
     print(f"  Mean Residence Time (RT): {verify_metrics['mean_rt']:.4f}")
     print(f"  CV of RT:                  {verify_metrics['cv_rt']:.4f} (Values < 1.0 confirm periodic clock)")
@@ -1117,70 +1145,666 @@ def run_integrated_omega_suite(initial_params: Optional[OmegaParameters] = None)
     print(f"  Mean Structural Energy:    {thermo['mean_energy']:.4f}")
 
 # =====================================================================
-# 16. MAIN ENTRY
+# 16. WINDY.COM INTEGRATION MODULE
+# =====================================================================
+@dataclass
+class WindyPoint:
+    lat: float
+    lon: float
+    wind_u: float
+    wind_v: float
+    sst_anomaly: float
+    timestamp: str
+    confidence: float
+
+class WindyComExporter:
+    GRID_LATS = np.linspace(-5, 5, 11)
+    GRID_LONS = np.linspace(160, 260, 51)
+
+    def __init__(self, trajectory: np.ndarray, wind_series: np.ndarray,
+                 dt: float = 0.1, start_date: Optional[datetime] = None):
+        self.traj = trajectory
+        self.wind = wind_series
+        self.dt = dt
+        self.start_date = start_date or datetime.now()
+        self.points: List[WindyPoint] = []
+        self._build_wind_field()
+
+    def _phi_to_wind_anomaly(self, phi: float, base_tau: float) -> Tuple[float, float]:
+        u_anom = base_tau * 25.0 + phi * 3.5
+        v_anom = -phi * 0.8 + np.random.normal(0, 0.3)
+        return u_anom, v_anom
+
+    def _build_wind_field(self):
+        n_steps = min(len(self.traj), len(self.wind))
+        for step in range(0, n_steps, 50):
+            phi = self.traj[step, 0]
+            tau = self.wind[step] if step < len(self.wind) else 0.0
+            t_delta = timedelta(hours=step * self.dt * 6)
+            timestamp = (self.start_date + t_delta).isoformat()
+            for lat in self.GRID_LATS:
+                for lon in self.GRID_LONS:
+                    lat_factor = np.cos(np.radians(lat))**2
+                    u, v = self._phi_to_wind_anomaly(phi, tau)
+                    u *= lat_factor
+                    v *= lat_factor * 0.5
+                    conf = 1.0 - abs(lon - 200) / 120.0
+                    conf = np.clip(conf, 0.3, 1.0)
+                    self.points.append(WindyPoint(
+                        lat=float(lat),
+                        lon=float(lon),
+                        wind_u=round(float(u), 3),
+                        wind_v=round(float(v), 3),
+                        sst_anomaly=round(float(phi), 3),
+                        timestamp=timestamp,
+                        confidence=round(float(conf), 2)
+                    ))
+
+    def export_geojson(self, filepath: str) -> str:
+        features = []
+        for pt in self.points:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [pt.lon, pt.lat]},
+                "properties": {
+                    "u": pt.wind_u, "v": pt.wind_v,
+                    "sst_anomaly": pt.sst_anomaly,
+                    "time": pt.timestamp,
+                    "confidence": pt.confidence,
+                    "name": f"Ω-ENSO φ={pt.sst_anomaly:+.2f}"
+                }
+            })
+        geojson = {
+            "type": "FeatureCollection",
+            "metadata": {
+                "title": "Ω-ENSO Wind Anomaly Prediction",
+                "source": "Ω-Box Model v1.4",
+                "generated": datetime.now().isoformat(),
+                "description": "Equatorial Pacific wind anomalies from Ω-ENSO framework"
+            },
+            "features": features
+        }
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(geojson, f, indent=2)
+        print(f"[Windy.com] GeoJSON exported: {filepath}")
+        return filepath
+
+    def export_kml(self, filepath: str) -> str:
+        kml_header = '''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>Ω-ENSO Wind Field Prediction</name>
+  <description>Equatorial Pacific wind anomalies from Ω-Box model</description>
+  <Style id="elNino">
+    <LineStyle><color>ff0000ff</color><width>2</width></LineStyle>
+  </Style>
+  <Style id="laNina">
+    <LineStyle><color>ffff0000</color><width>2</width></LineStyle>
+  </Style>
+  <Style id="neutral">
+    <LineStyle><color>ff00ff00</color><width>1</width></LineStyle>
+  </Style>
+</Document>
+</kml>'''
+        placemarks = []
+        for pt in self.points:
+            style = "elNino" if pt.sst_anomaly > 0.3 else ("laNina" if pt.sst_anomaly < -0.3 else "neutral")
+            scale = 0.5
+            end_lon = pt.lon + pt.wind_u * scale
+            end_lat = pt.lat + pt.wind_v * scale
+            placemarks.append(f'''  <Placemark>
+    <name>φ={pt.sst_anomaly:+.2f} τ=({pt.wind_u:+.1f},{pt.wind_v:+.1f})</name>
+    <styleUrl>#{style}</styleUrl>
+    <TimeStamp><when>{pt.timestamp}</when></TimeStamp>
+    <LineString>
+      <coordinates>{pt.lon},{pt.lat},0 {end_lon},{end_lat},0</coordinates>
+    </LineString>
+  </Placemark>''')
+        kml = kml_header + '\n'.join(placemarks) + '\n</Document>\n</kml>'
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        with open(filepath, 'w') as f:
+            f.write(kml)
+        print(f"[Windy.com] KML exported: {filepath}")
+        return filepath
+
+    def export_csv(self, filepath: str) -> str:
+        lines = ["lat,lon,u,v,sst_anomaly,timestamp,confidence"]
+        for pt in self.points:
+            lines.append(f"{pt.lat},{pt.lon},{pt.wind_u},{pt.wind_v},{pt.sst_anomaly},{pt.timestamp},{pt.confidence}")
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(lines))
+        print(f"[Windy.com] CSV exported: {filepath}")
+        return filepath
+
+def create_windy_dashboard(filepath: str = "windy_enso_dashboard.html",
+                            model_phi: float = 0.0,
+                            model_tau: float = 0.0) -> str:
+    if model_phi > 0.5:
+        status_color = "#e74c3c"
+        status_text = "EL NIÑO CONDITIONS"
+        wind_desc = "Westerly wind anomalies expected"
+    elif model_phi < -0.5:
+        status_color = "#3498db"
+        status_text = "LA NIÑA CONDITIONS"
+        wind_desc = "Easterly trade wind strengthening"
+    else:
+        status_color = "#2ecc71"
+        status_text = "ENSO-NEUTRAL"
+        wind_desc = "Near-normal wind patterns"
+
+    phi_class = "phi-positive" if model_phi > 0.3 else ("phi-negative" if model_phi < -0.3 else "phi-neutral")
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ω-ENSO × Windy.com Dashboard</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #fff; }}
+        .header {{
+            background: linear-gradient(135deg, #1a1f3a 0%, #0d1120 100%);
+            padding: 20px 30px;
+            border-bottom: 2px solid {status_color};
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .header h1 {{ font-size: 1.5rem; font-weight: 300; letter-spacing: 2px; }}
+        .header .omega {{ color: #00d4ff; font-weight: 700; }}
+        .status-badge {{
+            background: {status_color}22;
+            border: 1px solid {status_color};
+            color: {status_color};
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+        }}
+        .dashboard {{
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            height: calc(100vh - 80px);
+        }}
+        .sidebar {{
+            background: #11152a;
+            padding: 25px;
+            border-right: 1px solid #1e2444;
+            overflow-y: auto;
+        }}
+        .metric {{
+            background: #161b36;
+            border-radius: 12px;
+            padding: 18px;
+            margin-bottom: 15px;
+            border: 1px solid #1e2444;
+        }}
+        .metric-label {{ font-size: 0.75rem; color: #8892b0; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }}
+        .metric-value {{ font-size: 1.6rem; font-weight: 700; color: #fff; }}
+        .metric-sub {{ font-size: 0.8rem; color: #64ffda; margin-top: 4px; }}
+        .phi-positive {{ color: #ff6b6b; }}
+        .phi-negative {{ color: #4ecdc4; }}
+        .phi-neutral {{ color: #ffe66d; }}
+        .map-container {{ position: relative; width: 100%; height: 100%; }}
+        .map-container iframe {{ width: 100%; height: 100%; border: none; }}
+        .overlay {{
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(10, 14, 26, 0.92);
+            border: 1px solid #1e2444;
+            border-radius: 12px;
+            padding: 18px;
+            max-width: 320px;
+        }}
+        .overlay h3 {{ font-size: 0.9rem; color: #00d4ff; margin-bottom: 10px; }}
+        .overlay p {{ font-size: 0.8rem; color: #a0aec0; line-height: 1.5; }}
+        .wind-legend {{
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(10, 14, 26, 0.92);
+            border: 1px solid #1e2444;
+            border-radius: 12px;
+            padding: 15px;
+        }}
+        .wind-legend h4 {{ font-size: 0.75rem; color: #8892b0; margin-bottom: 10px; }}
+        .legend-item {{ display: flex; align-items: center; margin-bottom: 8px; font-size: 0.8rem; }}
+        .legend-color {{ width: 20px; height: 3px; margin-right: 10px; border-radius: 2px; }}
+        .refresh-btn {{
+            background: #00d4ff;
+            color: #0a0e1a;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+        }}
+        .refresh-btn:hover {{ opacity: 0.85; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span class="omega">Ω</span>-ENSO × Windy.com Dashboard</h1>
+        <div class="status-badge">{status_text}</div>
+    </div>
+    <div class="dashboard">
+        <div class="sidebar">
+            <div class="metric">
+                <div class="metric-label">SST Anomaly (φ)</div>
+                <div class="metric-value {phi_class}">{model_phi:+.3f} °C</div>
+                <div class="metric-sub">{"Above threshold" if abs(model_phi) > 0.4 else "Within neutral band"}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Wind Stress (τ)</div>
+                <div class="metric-value">{model_tau:+.3f}</div>
+                <div class="metric-sub">{"Westerly burst" if model_tau > 0.05 else ("Easterly surge" if model_tau < -0.05 else "Near calm")}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Predicted Zonal Wind</div>
+                <div class="metric-value">{model_tau * 25:+.1f} m/s</div>
+                <div class="metric-sub">{wind_desc}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Model Timestamp</div>
+                <div class="metric-value" style="font-size:1rem">{datetime.now().strftime("%Y-%m-%d %H:%M UTC")}</div>
+            </div>
+            <button class="refresh-btn" onclick="location.reload()">↻ Refresh Model</button>
+        </div>
+        <div class="map-container">
+            <iframe src="https://www.windy.com/-Equatorial-Pacific-eqpac?eqpac,0.000,200.000,4" allowfullscreen></iframe>
+            <div class="overlay">
+                <h3>Ω-Model Prediction</h3>
+                <p>The Ω-Box model predicts <strong>{status_text.lower()}</strong> conditions with a zonal wind anomaly of <strong>{model_tau * 25:+.1f} m/s</strong>. {wind_desc} across the equatorial Pacific.</p>
+            </div>
+            <div class="wind-legend">
+                <h4>Wind Anomaly Legend</h4>
+                <div class="legend-item"><div class="legend-color" style="background:#ff6b6b"></div><span>El Niño (westerly)</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#4ecdc4"></div><span>La Niña (easterly)</span></div>
+                <div class="legend-item"><div class="legend-color" style="background:#ffe66d"></div><span>Neutral</span></div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>'''
+    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+    with open(filepath, 'w') as f:
+        f.write(html)
+    print(f"[Windy.com] Dashboard created: {filepath}")
+    return filepath
+
+# =====================================================================
+# 17. META-LEARNING MODULE (EVOLUTIONARY)
+# =====================================================================
+@dataclass
+class MetaConfig:
+    pop_size: int = 8
+    n_generations: int = 10
+    episode_steps: int = 800
+    dt: float = 0.1
+    elite_frac: float = 0.25
+    initial_sigma_mut: float = 0.15
+    final_sigma_mut: float = 0.03
+    target_cv: float = 1.0
+    target_switches: int = 12
+    seed: int = 42
+
+@dataclass
+class Individual:
+    sigma: float
+    lam: float
+    tau_amp: float
+    tau_coupling: float
+    loss: float = float('inf')
+    cv: float = 0.0
+    snr: float = 0.0
+    n_switches: int = 0
+    phi_var: float = 0.0
+
+    def to_params(self, base: OmegaParameters) -> OmegaParameters:
+        p = deepcopy(base)
+        p.sigma = float(np.clip(self.sigma, 0.3, 2.0))
+        p.lam = float(np.clip(self.lam, 0.1, 1.5))
+        p.tau_amp = float(np.clip(self.tau_amp, 0.0, 0.8))
+        p.tau_coupling = float(np.clip(self.tau_coupling, 0.0, 1.0))
+        return p
+
+    @staticmethod
+    def from_params(p: OmegaParameters) -> "Individual":
+        return Individual(sigma=p.sigma, lam=p.lam,
+                          tau_amp=p.tau_amp, tau_coupling=p.tau_coupling)
+
+class MetaLearner:
+    META_KEYS = ['sigma', 'lam', 'tau_amp', 'tau_coupling']
+
+    def __init__(self, config: Optional[MetaConfig] = None,
+                 base_params: Optional[OmegaParameters] = None):
+        self.cfg = config or MetaConfig()
+        self.base_params = base_params or OmegaParameters()
+        self.rng = np.random.default_rng(self.cfg.seed)
+        self.population: List[Individual] = []
+        self.history: List[Dict] = []
+        self.best_ever: Optional[Individual] = None
+
+    def _random_individual(self) -> Individual:
+        return Individual(
+            sigma=self.rng.uniform(0.5, 1.3),
+            lam=self.rng.uniform(0.2, 0.9),
+            tau_amp=self.rng.uniform(0.05, 0.35),
+            tau_coupling=self.rng.uniform(0.10, 0.55)
+        )
+
+    def evaluate(self, ind: Individual, seed: int) -> float:
+        params = ind.to_params(self.base_params)
+        model = OmegaBoxModel(params=params, seed=seed)
+        init = np.array([
+            self.rng.normal(0, 0.6),
+            self.rng.normal(-1.5, 1.2),
+            self.rng.normal(0, 0.3),
+            0.0, 0.0, 0.0
+        ])
+        traj = model.integrate(n_steps=self.cfg.episode_steps, dt=self.cfg.dt,
+                               stochastic=True, init=init)
+        phi = traj[:, 0]
+        met = coherence_metrics(phi, self.cfg.dt, threshold=0.4)
+        cv = met['cv_rt'] if not np.isnan(met['cv_rt']) else 10.0
+        n_sw = met['n_switches']
+        snr = snr_proxy(phi, self.cfg.dt)
+        phi_var = np.var(phi)
+
+        exploration = 3.0 * np.exp(-phi_var * 3.0)
+        switch_loss = abs(n_sw - self.cfg.target_switches) / max(self.cfg.target_switches, 1)
+        cv_loss = abs(cv - self.cfg.target_cv)
+        snr_loss = 10.0 / (snr + 1.0)
+        loss = cv_loss + snr_loss + switch_loss + exploration
+
+        ind.loss = float(loss)
+        ind.cv = float(cv)
+        ind.snr = float(snr)
+        ind.n_switches = int(n_sw)
+        ind.phi_var = float(phi_var)
+        return loss
+
+    def train(self) -> OmegaParameters:
+        print("=" * 70)
+        print("Ω-FRAMEWORK META-LEARNING — EVOLUTIONARY SEARCH")
+        print("=" * 70)
+        print(f"Population: {self.cfg.pop_size}, Generations: {self.cfg.n_generations}")
+        print(f"Episode steps: {self.cfg.episode_steps}, Params: {self.META_KEYS}")
+        print("-" * 70)
+
+        self.population = [self._random_individual() for _ in range(self.cfg.pop_size)]
+
+        for gen in range(self.cfg.n_generations):
+            for i, ind in enumerate(self.population):
+                seed = self.cfg.seed + gen * self.cfg.pop_size + i
+                self.evaluate(ind, seed)
+
+            self.population.sort(key=lambda x: x.loss)
+            best = self.population[0]
+
+            if self.best_ever is None or best.loss < self.best_ever.loss:
+                self.best_ever = deepcopy(best)
+
+            self.history.append({
+                'gen': gen,
+                'best_loss': best.loss,
+                'mean_loss': np.mean([p.loss for p in self.population]),
+                'best_cv': best.cv,
+                'best_snr': best.snr,
+                'best_switches': best.n_switches,
+                'best_params': {k: getattr(best, k) for k in self.META_KEYS}
+            })
+
+            mut_scale = self.cfg.initial_sigma_mut * (
+                self.cfg.final_sigma_mut / self.cfg.initial_sigma_mut
+            ) ** (gen / max(self.cfg.n_generations - 1, 1))
+
+            if gen % 2 == 0 or gen == self.cfg.n_generations - 1:
+                print(f"Gen {gen:2d} | best_loss={best.loss:.3f} | "
+                      f"CV={best.cv:.2f} SNR={best.snr:.1f} Sw={best.n_switches:2d} | "
+                      f"σ={best.sigma:.3f} λ={best.lam:.3f} τa={best.tau_amp:.3f} τc={best.tau_coupling:.3f} | "
+                      f"mut={mut_scale:.3f}")
+
+            if gen == self.cfg.n_generations - 1:
+                break
+
+            n_elite = max(1, int(self.cfg.elite_frac * self.cfg.pop_size))
+            new_pop = [deepcopy(self.population[i]) for i in range(n_elite)]
+
+            while len(new_pop) < self.cfg.pop_size:
+                parent = self.population[self.rng.integers(0, n_elite)]
+                child = Individual(
+                    sigma=parent.sigma + self.rng.normal(0, mut_scale),
+                    lam=parent.lam + self.rng.normal(0, mut_scale),
+                    tau_amp=parent.tau_amp + self.rng.normal(0, mut_scale * 0.5),
+                    tau_coupling=parent.tau_coupling + self.rng.normal(0, mut_scale)
+                )
+                new_pop.append(child)
+
+            self.population = new_pop
+
+        print("-" * 70)
+        print(f"EVOLUTION COMPLETE. Best loss: {self.best_ever.loss:.4f}")
+        print("Best parameters found:")
+        for k in self.META_KEYS:
+            print(f"  {k:15s} = {getattr(self.best_ever, k):.6f}")
+        print("=" * 70)
+        return self.best_ever.to_params(self.base_params)
+
+    def adapt_online(self, obs_phi: float, obs_tau: float,
+                     current: OmegaParameters) -> OmegaParameters:
+        base_ind = Individual.from_params(current)
+        best_err = float('inf')
+        best_ind = base_ind
+
+        for _ in range(12):
+            candidate = Individual(
+                sigma=base_ind.sigma + self.rng.normal(0, 0.08),
+                lam=base_ind.lam + self.rng.normal(0, 0.08),
+                tau_amp=base_ind.tau_amp + self.rng.normal(0, 0.05),
+                tau_coupling=base_ind.tau_coupling + self.rng.normal(0, 0.08)
+            )
+            p = candidate.to_params(self.base_params)
+            model = OmegaBoxModel(params=p, seed=42)
+            model.set_state(np.array([obs_phi, -1.5, 0.0, 0.0, 0.0, 0.0]))
+            traj = model.integrate(n_steps=300, dt=0.1, stochastic=True)
+            phi_pred = traj[-1, 0]
+            wind = model.get_wind_series()
+            tau_pred = wind[-1] if len(wind) > 0 else 0.0
+            err = (phi_pred - obs_phi)**2 + (tau_pred - obs_tau)**2
+            if err < best_err:
+                best_err = err
+                best_ind = candidate
+
+        return best_ind.to_params(self.base_params)
+
+    def save_checkpoint(self, filepath: str):
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        data = {
+            'history': self.history,
+            'best': {k: getattr(self.best_ever, k) for k in self.META_KEYS + ['loss', 'cv', 'snr', 'n_switches']},
+            'timestamp': datetime.now().isoformat()
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"[Meta-Learning] Checkpoint saved: {filepath}")
+
+# =====================================================================
+# 18. DEMO ADAPTIVE THRESHOLD (optional standalone)
+# =====================================================================
+def demo_adaptive_threshold_dynamics():
+    import matplotlib.pyplot as plt
+
+    p = OmegaParameters(
+        sigma=0.78, lam=0.38, A_force=0.03, T_force=48.0,
+        eta_std=0.05, xi_std=0.02, theta_std=0.01,
+        kappa=0.05, nu=0.02, beta_g=0.01, gamma=0.05,
+        gamma_J=0.05, mu_J=0.02
+    )
+    model = OmegaBoxModel(params=p, seed=42)
+    model.set_state(np.array([0.5, -3.0, 0.0, 0.0, 0.0, 0.0]))
+
+    n_steps, dt = 3000, 0.1
+    traj = model.integrate(n_steps=n_steps, dt=dt, stochastic=True)
+    wind = model.get_wind_series()
+
+    sigma_crits, lambda_crits, alpha_T_effs, d_sigmas, d_lambdas = [], [], [], [], []
+    for i in range(len(traj)):
+        dist = bifurcation_distance(traj[i], p)
+        sigma_crits.append(dist["sigma_crit"])
+        lambda_crits.append(dist["lambda_crit"])
+        alpha_T_effs.append(dist["alpha_T_eff"])
+        d_sigmas.append(dist["d_sigma"])
+        d_lambdas.append(dist["d_lambda"])
+
+    sigma_crits = np.array(sigma_crits)
+    lambda_crits = np.array(lambda_crits)
+    alpha_T_effs = np.array(alpha_T_effs)
+    d_sigmas = np.array(d_sigmas)
+    d_lambdas = np.array(d_lambdas)
+    t = np.arange(len(traj)) * dt
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True, gridspec_kw={"hspace": 0.08})
+
+    ax = axes[0]
+    ax.plot(t, traj[:, 0], color="#00d4ff", lw=1.2, label=r"$\phi$ (SST anomaly)")
+    ax.axhline(0.4, color="crimson", ls="--", lw=1, alpha=0.6, label="Bistability threshold")
+    ax.axhline(-0.4, color="crimson", ls="--", lw=1, alpha=0.6)
+    ax.set_ylabel(r"$\phi$  [°C]")
+    ax.set_title("Ω‑Box Trajectory with Adaptive Bifurcation Surface")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[1]
+    ax.plot(t, alpha_T_effs, color="#2ecc71", lw=1.2, label=r"$\alpha_T^{\mathrm{eff}}$")
+    ax.axhline(p.alpha0, color="gray", ls="--", lw=1, alpha=0.6, label=r"$\alpha_0$ (neutral)")
+    ax.set_ylabel(r"$\alpha_T^{\mathrm{eff}}$")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[2]
+    ax.plot(t, sigma_crits, color="#e74c3c", lw=1.5, label=r"Dynamic $\sigma_{\mathrm{crit}}(t)$")
+    ax.axhline(p.sigma, color="#3498db", ls="--", lw=1.5, alpha=0.8, label=r"Actual $\sigma$ = 0.78")
+    ax.fill_between(t, sigma_crits, p.sigma, where=(p.sigma > sigma_crits),
+                    color="#e74c3c", alpha=0.15, interpolate=True, label="Linearly unstable region")
+    ax.set_ylabel(r"$\sigma$")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[3]
+    ax.plot(t, d_sigmas, color="#9b59b6", lw=1.2, label=r"$d_\sigma = \sigma - \sigma_{\mathrm{crit}}$")
+    ax.plot(t, d_lambdas, color="#f39c12", lw=1.2, label=r"$d_\lambda = \lambda - \lambda_{\mathrm{crit}}$")
+    ax.axhline(0, color="white", ls="-", lw=0.8, alpha=0.5)
+    ax.fill_between(t, 0, d_sigmas, where=(d_sigmas > 0), color="#e74c3c", alpha=0.2, interpolate=True)
+    ax.set_ylabel("Signed distance")
+    ax.set_xlabel("Time  [model units]")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    out_path = "adaptive_bifurcation_demo.png"
+    plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.show()
+    print(f"\n[Saved] {out_path}")
+
+    frac_unstable = np.mean((d_sigmas > 0) & (d_lambdas > 0)) * 100
+    print(f"\n[Summary] Linearly unstable {frac_unstable:.1f}% of the time,")
+    print(f"          yet the nonlinear cycle remains bounded.")
+    print(f"          Max σ_crit shift: {np.max(sigma_crits)-np.min(sigma_crits):.4f}")
+    print(f"          Max λ_crit shift: {np.max(lambda_crits)-np.min(lambda_crits):.4f}")
+    return {"traj": traj, "wind": wind, "sigma_crit_series": sigma_crits,
+            "lambda_crit_series": lambda_crits, "alpha_T_eff_series": alpha_T_effs}
+
+# =====================================================================
+# 19. MAIN ENTRY
 # =====================================================================
 if __name__ == "__main__":
-    print("Ω-FRAMEWORK ENSO — COMPLETE UNIFIED PRODUCTION SUITE")
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--meta":
+        demo_meta_learning()
+        sys.exit(0)
+
+    print("Ω-FRAMEWORK ENSO — COMPLETE UNIFIED PRODUCTION SUITE (v1.6)")
     print("=" * 70)
 
-    # 1. Run core model architecture validation checks
+    # 1. Core validation and live monitor
     validate_invariance(n_steps=500, dt=0.1)
+    # Choose monitor: adaptive (new) or fixed (legacy)
+    # For adaptive, we need a model instance to get state
+    base_params = OmegaParameters()
+    model_monitor = OmegaBoxModel(params=base_params, seed=42)
+    # Run adaptive monitor
+    noaa_summary = fetch_current_enso_state()
+    adaptive_result = execute_adaptive_2026_monitor(model_monitor, noaa_summary)
 
-    # 2. Trigger the live 2026 early warning tracking system
-    live_2026_risk_log = execute_2026_live_bifurcation_monitor()
+    # 2. Archive adaptive result
+    log_dir = "./live_2026_logs/"
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = f"enso_risk_profile_adaptive_{datetime.now().strftime('%Y%m%d')}.json"
+    with open(os.path.join(log_dir, log_filename), 'w') as f:
+        json.dump(adaptive_result, f, indent=4)
+    print(f"\n[Archive] Adaptive risk saved: {os.path.join(log_dir, log_filename)}")
 
-    # 3. Formulate the current model parameters using live 2026 weights
+    # 3. Long-run projection using adaptive parameters
+    print("\n--- Long-Duration Projections ---")
     active_params = OmegaParameters(
-        sigma=live_2026_risk_log["active_sigma"],
-        lam=live_2026_risk_log["active_lambda"],
+        sigma=adaptive_result["active_sigma"],
+        lam=adaptive_result["active_lambda"],
         A_force=0.03,
         T_force=48.0,
         noise_type="student_t"
     )
-
-    # 4. Automate local data archiving for your research logs
-    log_dir = "./live_2026_logs/"
-    os.makedirs(log_dir, exist_ok=True)
-    log_filename = f"enso_risk_profile_{datetime.now().strftime('%Y%m%d')}.json"
-
-    with open(os.path.join(log_dir, log_filename), 'w') as log_file:
-        json.dump(live_2026_risk_log, log_file, indent=4)
-    print(f"\n[Archive System] Chronological risk matrix saved to: {os.path.join(log_dir, log_filename)}")
-
-    # 5. Launch long-duration simulation run with the live modern metrics
-    print("\n--- Initializing Long-Duration Projections with Current 2026 Weights ---")
     live_model = OmegaBoxModel(params=active_params, seed=42)
-    live_trajectory = live_model.integrate(n_steps=10000, dt=0.1, stochastic=True)
+    live_traj = live_model.integrate(n_steps=10000, dt=0.1, stochastic=True)
+    live_coherence = coherence_metrics(live_traj[2000:, 0], dt=0.1, threshold=BISTABILITY_THRESHOLD)
+    print(f"Basin transitions: {live_coherence['n_switches']} flips.")
 
-    # Re-evaluate live coherence step limits based on current telemetry injections
-    live_coherence = coherence_metrics(live_trajectory[2000:, 0], dt=0.1, threshold=0.0)
-    print(f"  Projected Basin Transition Count across current conditions: {live_coherence['n_switches']} flips.")
-
-    # 6. Optional: Replay the 1997 Super El Niño historical timeline
-    print("\n" + "="*70)
-    print("OPTIONAL: Replaying 1997 Super El Niño Historical Timeline")
-    print("="*70)
-    enso_1997_timeline = compile_historical_event_timeline(start_year=1997, start_month=5, duration_months=6)
-
-    print("\n" + "="*50 + "\n1997 EVENT DYNAMIC ACCELERATION SUMMARY:\n" + "="*50)
+    # 4. Historical replay (1997)
+    print("\n--- 1997 Super El Niño Replay ---")
+    enso_1997_timeline = compile_historical_event_timeline(1997, 5, 6)
+    print("\n1997 EVENT DYNAMIC ACCELERATION SUMMARY:")
     for i in range(len(enso_1997_timeline["dates"])):
         m_date = enso_1997_timeline["dates"][i]
         s_scale = enso_1997_timeline["sigma_scalers"][i]
         l_scale = enso_1997_timeline["lambda_scalers"][i]
-
         active_sigma_1997 = 0.5567 * s_scale
         active_lambda_1997 = 0.2656 * l_scale
-
-        print(f"Month: {m_date} | Real SST Variance Scale: {s_scale:.4f} -> Active Sigma: {active_sigma_1997:.4f}")
-        print(f"               | Real OLR Damping Scale:  {l_scale:.4f} -> Active Lambda: {active_lambda_1997:.4f}")
-
-        if active_sigma_1997 >= 0.80 and active_lambda_1997 >= 0.41:
-            print(f"               [➔ CRITICAL] Real-world data enters your model's Bistable Zone!")
-        print("-" * 50)
-
-    # Plot the historical timeline
+        print(f"Month: {m_date} | Active Sigma: {active_sigma_1997:.4f} | Active Lambda: {active_lambda_1997:.4f}")
     plot_historical_timeline(enso_1997_timeline, "1997 Super El Niño Development")
 
-    print("\n" + "="*70)
+    # 5. Windy.com Export
+    print("\n--- Windy.com Export ---")
+    wind_series = live_model.get_wind_series()
+    exporter = WindyComExporter(live_traj, wind_series, dt=0.1)
+    out_dir = "./windy_com_output"
+    os.makedirs(out_dir, exist_ok=True)
+    exporter.export_geojson(os.path.join(out_dir, "enso_wind_anomalies.geojson"))
+    exporter.export_kml(os.path.join(out_dir, "enso_wind_field.kml"))
+    exporter.export_csv(os.path.join(out_dir, "enso_wind_data.csv"))
+    final_phi = live_traj[-1, 0]
+    final_tau = wind_series[-1] if len(wind_series) > 0 else 0.0
+    create_windy_dashboard(
+        filepath=os.path.join(out_dir, "windy_enso_dashboard.html"),
+        model_phi=final_phi,
+        model_tau=final_tau
+    )
+
+    print("\n" + "=" * 70)
     print("Ω-FRAMEWORK EXECUTION COMPLETE")
-    print("="*70)
+    print("=" * 70)
+    print(f"\nGenerated files in: {out_dir}")
+    print("  • enso_wind_anomalies.geojson  → Upload to windy.com")
+    print("  • enso_wind_field.kml          → Upload to windy.com")
+    print("  • enso_wind_data.csv           → Raw data")
+    print("  • windy_enso_dashboard.html    → Open in browser")
+    print("\nTo use on windy.com:")
+    print("  1. Go to https://www.windy.com")
+    print("  2. Click Menu → Upload")
+    print("  3. Select the KML or GeoJSON file")
