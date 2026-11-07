@@ -1,6 +1,6 @@
 """
 ======================================================================
-Ω‑FRAMEWORK ENSO — COMPLETE UNIFIED SUITE (v1.6)
+Ω‑FRAMEWORK ENSO — COMPLETE UNIFIED SUITE (v1.7)
 ======================================================================
 Includes:
   • 6D Ω‑Box model with gauge field, memory, phase
@@ -12,8 +12,36 @@ Includes:
   • Evolutionary meta‑learning (self‑tuning of σ, λ, τ_amp, τ_coupling)
   • Adaptive bifurcation surface (state‑dependent thresholds)
 
-Author: (Your name)
+Author: Alton Bryan
 Date: 2026
+
+v1.7 REPAIR NOTES (repairs only — model equations and parameters are
+unchanged from v1.6; core numerics regression-checked bit-identical):
+  R1. NOAA OISST route corrected to the real AWS Open Data bucket
+      (noaa-cdr-sea-surface-temp-optimum-interpolation-pds) with the
+      verified key layout, final then _preliminary file names.
+      v1.6's bucket names do not exist, so v1.6 could never ingest
+      live data on any machine.
+  R2. No silent fabrication: in DATA_MODE="live" (default) a failed
+      feed yields DATA INCOMPLETE and the monitor issues NO VERDICT.
+      Fabricated inputs exist only under DATA_MODE="mock", chosen by
+      the operator, and are labeled MOCK at every use.
+  R3. λ_crit outside its search range is reported as OUT OF RANGE
+      (NaN), never as the grid-edge value.
+  R4. Output paths are local (./omega_output), not a foreign
+      machine's /mnt directory.
+  R5. The --meta entry point now runs a real (small) MetaLearner
+      demonstration; v1.6 called a function that did not exist.
+  R6. Windy export noise is seeded (reproducible) and the GeoJSON
+      metadata states the field is synthesized, not observed.
+  [OPEN] OLR daily CDR: anonymous S3 access exposes documentation
+      only; a live OLR route is not established. Until it is, a live
+      monitor run reports DATA INCOMPLETE rather than inventing λ.
+  [OPEN — owner ruling] σ is fed by the Niño-3.4 spatial variance of
+      the OISST field named by OISST_METRIC_FIELD. v1.6 used 'sst'
+      (absolute SST) under the name "anomaly variance". The monitor
+      prints both 'sst' and 'anom' variances and both implied σ
+      values; the shipped default preserves v1.6 behavior ("sst").
 """
 
 import numpy as np
@@ -27,6 +55,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import io
+import tempfile
 import urllib.request
 import warnings
 from copy import deepcopy
@@ -56,6 +85,21 @@ except ImportError:
 BISTABILITY_THRESHOLD: float = 0.4
 STATE_CLIP_BOUNDS: Tuple[float, float] = (-10.0, 10.0)
 PSI_CLIP_BOUNDS: Tuple[float, float] = (-20.0, 20.0)
+
+# =====================================================================
+# OPERATOR CONFIG (v1.7) — set these deliberately; nothing here is
+# inferred at runtime.
+# =====================================================================
+# "live": real NOAA data or an honest DATA INCOMPLETE / NO VERDICT.
+# "mock": fabricated inputs for exercising the machinery, labeled
+#         MOCK at every use and in every archived record.
+DATA_MODE: str = "live"
+# OISST field whose Niño-3.4 spatial variance feeds σ.
+# [OPEN — owner ruling] v1.6 computed the variance of 'sst' (absolute
+# SST) under the name "anomaly variance". Default preserves v1.6.
+OISST_METRIC_FIELD: str = "sst"
+# Local output directory for plots (created on demand).
+OUTPUT_DIR: str = "./omega_output"
 
 # =====================================================================
 # 1. PARAMETERS & TYPES
@@ -661,50 +705,116 @@ def generate_synthetic_noaa_backup(reason: str) -> dict:
     print("[MOCK-FALLBACK] Fabricating regional climate matrix arrays locally...")
     return {
         "sst_anomaly_variance": float(np.random.uniform(1.2, 1.8)),
-        "atmosphere_damping_scale": float(np.random.uniform(0.9, 1.1))
+        "atmosphere_damping_scale": float(np.random.uniform(0.9, 1.1)),
+        "data_source": "mock",
+        "oisst_ok": False,
+        "olr_ok": False,
+        "feed_notes": f"mock: {reason}",
     }
 
+def _incomplete_metrics(reason: str, partial: Optional[dict] = None) -> dict:
+    """Honest no-data record (v1.7): real values where a feed landed,
+    None where it did not. Never fabricated."""
+    m = {
+        "sst_anomaly_variance": None,
+        "atmosphere_damping_scale": None,
+        "data_source": "incomplete",
+        "oisst_ok": False,
+        "olr_ok": False,
+        "feed_notes": reason,
+    }
+    if partial:
+        m.update(partial)
+    return m
+
 def extract_enso_regional_metrics(target_date: Optional[datetime] = None) -> dict:
+    """Regional ENSO metrics with provenance (v1.7).
+
+    OISST route verified live 2026-11-07 against the AWS Open Data
+    registry: bucket noaa-cdr-sea-surface-temp-optimum-interpolation-pds,
+    keys data/v2.1/avhrr/{yyyymm}/oisst-avhrr-v02r01.{yyyymmdd}[._preliminary].nc
+    (recent days carry the _preliminary suffix; both are tried).
+
+    OLR daily CDR [OPEN]: the real bucket
+    (noaa-cdr-outgoing-longwave-radiation-daily-pds) exposes only its
+    documentation anonymously; no live OLR route is established, so
+    the OLR feed honestly reports failure instead of inventing λ.
+
+    Returns a dict whose "data_source" is "live", "mock", or
+    "incomplete". In "live" DATA_MODE a failed feed yields
+    "incomplete" with None values — never fabricated numbers.
+    """
+    if DATA_MODE == "mock":
+        return generate_synthetic_noaa_backup("operator-selected DATA_MODE='mock'.")
     if not HAS_S3_LIBS:
-        return generate_synthetic_noaa_backup("boto3 or xarray missing.")
-    aws_config = Config(signature_version=UNSIGNED, region_name="us-east-1", retries={'max_attempts': 1})
+        return _incomplete_metrics("boto3 or xarray missing; no live fetch attempted.")
+    aws_config = Config(signature_version=UNSIGNED, region_name="us-east-1", retries={'max_attempts': 2})
     s3 = boto3.client('s3', config=aws_config)
-    metrics = {"sst_anomaly_variance": 1.0, "atmosphere_damping_scale": 1.0}
-    live_ocean = live_atmos = False
     if target_date is None:
         target_date = datetime.now() - timedelta(days=4)
     year = target_date.strftime("%Y")
     month = target_date.strftime("%m")
     day = target_date.strftime("%d")
+    partial: Dict[str, Any] = {}
+    notes = []
+
+    # --- OISST (verified route) ---
+    ocean_bucket = "noaa-cdr-sea-surface-temp-optimum-interpolation-pds"
+    tmp_path = None
     try:
-        ocean_bucket = "noaa-oisst-pds"
-        ocean_key = f"oisst/v2.1/AVHRR/{year}{month}/oisst-avhrr-v02r01.{year}{month}{day}.nc"
-        ocean_response = s3.get_object(Bucket=ocean_bucket, Key=ocean_key)
-        with xr.open_dataset(io.BytesIO(ocean_response['Body'].read())) as ds_ocean:
-            nino34_sst = ds_ocean['sst'].sel(lat=slice(-5, 5), lon=slice(190, 240))
-            metrics["sst_anomaly_variance"] = float(nino34_sst.var().values)
-            live_ocean = True
-            print(f" -> [OISST] Pulled data for {year}-{month}-{day}")
+        payload = None
+        landed_date = None
+        # OISST publishes with a lag of several days: walk back from
+        # the requested date (at most 7 days) to the newest file that
+        # actually exists, and record the date that landed.
+        for back in range(0, 8):
+            cand = target_date - timedelta(days=back)
+            cy, cm, cd = cand.strftime("%Y"), cand.strftime("%m"), cand.strftime("%d")
+            base_key = f"data/v2.1/avhrr/{cy}{cm}/oisst-avhrr-v02r01.{cy}{cm}{cd}"
+            for suffix in (".nc", "_preliminary.nc"):
+                try:
+                    payload = s3.get_object(Bucket=ocean_bucket, Key=base_key + suffix)['Body'].read()
+                    landed_date = cand
+                    break
+                except Exception:
+                    payload = None
+            if payload is not None:
+                break
+        if payload is None:
+            raise FileNotFoundError(f"no OISST file within 7 days before {year}-{month}-{day}")
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tf:
+            tf.write(payload)
+            tmp_path = tf.name
+        with xr.open_dataset(tmp_path) as ds_ocean:
+            box = {f: ds_ocean[f].sel(lat=slice(-5, 5), lon=slice(190, 240))
+                   for f in ("sst", "anom") if f in ds_ocean.data_vars}
+            if OISST_METRIC_FIELD not in box:
+                raise KeyError(f"OISST field '{OISST_METRIC_FIELD}' absent; present: {sorted(box)}")
+            partial["sst_field_variance"] = float(box["sst"].var().values) if "sst" in box else None
+            partial["anom_field_variance"] = float(box["anom"].var().values) if "anom" in box else None
+            partial["sst_anomaly_variance"] = float(box[OISST_METRIC_FIELD].var().values)
+            partial["oisst_ok"] = True
+            partial["oisst_date"] = landed_date.strftime("%Y-%m-%d") if landed_date else None
+            print(f" -> [OISST] Pulled data for {partial['oisst_date']} "
+                  f"(metric field: '{OISST_METRIC_FIELD}')")
     except Exception as e:
         warnings.warn(f"OISST fetch failed: {type(e).__name__}: {e}")
-    try:
-        atmos_bucket = "noaa-cdr-atmospheric-pds"
-        atmos_key = f"olr/v01r02/daily/{year}/olr-daily_v01r02_19790101_{year}{month}{day}.nc"
-        atmos_response = s3.get_object(Bucket=atmos_bucket, Key=atmos_key)
-        with xr.open_dataset(io.BytesIO(atmos_response['Body'].read())) as ds_atmos:
-            lat_start, lat_end = (-5, 5) if ds_atmos['lat'].values[0] < ds_atmos['lat'].values[-1] else (5, -5)
-            if ds_atmos['lon'].max() <= 180.0:
-                nino34_olr = ds_atmos['olr'].sel(lat=slice(lat_start, lat_end), lon=slice(-170, -120))
-            else:
-                nino34_olr = ds_atmos['olr'].sel(lat=slice(lat_start, lat_end), lon=slice(190, 240))
-            metrics["atmosphere_damping_scale"] = float(nino34_olr.mean().values) / 240.0
-            live_atmos = True
-            print(f" -> [OLR] Pulled data for {year}-{month}-{day}")
-    except Exception as e:
-        warnings.warn(f"OLR fetch failed: {type(e).__name__}: {e}")
-    if not (live_ocean and live_atmos):
-        return generate_synthetic_noaa_backup("Direct keys missing or target limits unarchived.")
-    return metrics
+        notes.append(f"OISST failed: {type(e).__name__}: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    # --- OLR daily CDR [OPEN — no established anonymous route] ---
+    notes.append("OLR [OPEN]: daily CDR bucket exposes documentation only to "
+                 "anonymous S3 access; live route not established.")
+    partial["olr_ok"] = False
+
+    if partial.get("oisst_ok") and partial.get("olr_ok"):
+        partial["data_source"] = "live"
+        partial["feed_notes"] = "both feeds live"
+        return partial
+    partial["feed_notes"] = "; ".join(notes) if notes else "one or more feeds failed"
+    return _incomplete_metrics(partial["feed_notes"], partial)
 
 def fetch_current_enso_state() -> Dict[str, Any]:
     print("\n[NOAA-API] Fetching live bulletins from NOAA CPC...")
@@ -882,7 +992,8 @@ def plot_all(gauge_res, noise_res, sr_res):
     axes[1,2].set_title("Energy (full Ω)")
     plt.suptitle("Ω-ENSO Framework Architecture Validation Plots Canvas", fontsize=13)
     plt.tight_layout()
-    plt.savefig('/mnt/agents/output/omega_validation_plots.png', dpi=150)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    plt.savefig(os.path.join(OUTPUT_DIR, 'omega_validation_plots.png'), dpi=150)
     plt.show()
 
 # =====================================================================
@@ -946,9 +1057,13 @@ def compute_critical_lambda(sigma_val: float, alpha_T_eff: float,
     lam_v, sig_v = lam_grid[valid], sig_grid[valid]
     diff = sig_v - sigma_val
     if np.all(diff > 0):
-        return float(lam_v[-1])
+        # v1.7: crossing lies above the searched λ range. Report NaN
+        # (OUT OF RANGE); v1.6 silently returned the grid edge 2.0,
+        # which printed as a measured λ_crit and a false d_λ.
+        return float('nan')
     if np.all(diff < 0):
-        return float(lam_v[0])
+        # v1.7: crossing lies below the searched λ range — OUT OF RANGE.
+        return float('nan')
     idx = np.where(np.diff(np.sign(diff)))[0]
     if len(idx) == 0:
         return float(lam_v[np.argmin(np.abs(diff))])
@@ -974,23 +1089,75 @@ def bifurcation_distance(state: np.ndarray, params: OmegaParameters) -> Dict[str
         "frac_sigma": float(d_sigma / max(abs(sigma_crit), 1e-6)),
         "frac_lambda": float(d_lambda / max(abs(lambda_crit), 1e-6)),
         "is_unstable_linear": bool(d_sigma > 0 and d_lambda > 0),
+        "lambda_crit_in_range": bool(not np.isnan(lambda_crit)),
     }
 
 def execute_adaptive_2026_monitor(model: OmegaBoxModel,
                                   noaa_summary: Optional[Dict] = None) -> Dict:
     current_date = datetime.now()
     live_metrics = extract_enso_regional_metrics(target_date=current_date)
-    active_sigma = 0.5567 * live_metrics["sst_anomaly_variance"]
-    active_lambda = 0.2656 * live_metrics["atmosphere_damping_scale"]
+    data_source = live_metrics.get("data_source", "incomplete")
     if noaa_summary is None:
         noaa_summary = fetch_current_enso_state()
     observed_phase = noaa_summary.get("observed_phase", "ENSO-Neutral")
+
+    print("\n" + "=" * 70)
+    print("ADAPTIVE 2026 ENSO BIFURCATION EARLY WARNING MONITOR")
+    print("=" * 70)
+    print(f"  Date:        {current_date.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  NOAA phase:  {observed_phase}")
+    print(f"  DATA SOURCE: {data_source.upper()}"
+          + ("  — FABRICATED INPUTS, NOT A MEASUREMENT" if data_source == "mock" else ""))
+
+    if data_source == "incomplete":
+        # v1.7: no verdict is issued on missing data. Whatever a feed
+        # genuinely delivered is printed; the rest is named, not filled.
+        print("-" * 70)
+        if live_metrics.get("oisst_ok"):
+            print(f"  OISST live (data date {live_metrics.get('oisst_date')}):  "
+                  f"var('{OISST_METRIC_FIELD}') Niño-3.4 = "
+                  f"{live_metrics['sst_anomaly_variance']:.4f} "
+                  f"→ σ would be {0.5567 * live_metrics['sst_anomaly_variance']:.4f}")
+            if live_metrics.get("anom_field_variance") is not None and \
+               live_metrics.get("sst_field_variance") is not None:
+                print(f"               var('sst') = {live_metrics['sst_field_variance']:.4f} "
+                      f"(σ {0.5567 * live_metrics['sst_field_variance']:.4f}) | "
+                      f"var('anom') = {live_metrics['anom_field_variance']:.4f} "
+                      f"(σ {0.5567 * live_metrics['anom_field_variance']:.4f}) "
+                      f"[OPEN — owner ruling]")
+        else:
+            print("  OISST:       NO DATA")
+        print("  OLR:         NO DATA [OPEN — live route not established]")
+        print(f"  Feeds:       {live_metrics.get('feed_notes', '')}")
+        print("-" * 70)
+        print("\n[⛔ NO_VERDICT_DATA_INCOMPLETE]")
+        print("=" * 70)
+        return {
+            "timestamp": str(current_date),
+            "alert_status": "NO_VERDICT_DATA_INCOMPLETE",
+            "active_sigma": None,
+            "active_lambda": None,
+            "noaa_phase": observed_phase,
+            "data_source": data_source,
+            "feeds": {"oisst_ok": bool(live_metrics.get("oisst_ok")),
+                      "olr_ok": bool(live_metrics.get("olr_ok")),
+                      "notes": live_metrics.get("feed_notes", "")},
+            "oisst_metrics": {k: live_metrics.get(k) for k in
+                              ("sst_field_variance", "anom_field_variance",
+                               "sst_anomaly_variance", "oisst_date")},
+        }
+
+    active_sigma = 0.5567 * live_metrics["sst_anomaly_variance"]
+    active_lambda = 0.2656 * live_metrics["atmosphere_damping_scale"]
     update_live_state(model, noaa_summary)
     model.p.sigma = active_sigma
     model.p.lam = active_lambda
     dist = bifurcation_distance(model.state, model.p)
-    f_sig, f_lam = dist["frac_sigma"], dist["frac_lambda"]
-    max_frac = max(f_sig, f_lam)
+    f_sig = dist["frac_sigma"]
+    lam_in = dist.get("lambda_crit_in_range", True)
+    f_lam = dist["frac_lambda"] if lam_in else None
+    fracs = [f_sig] + ([f_lam] if f_lam is not None else [])
+    max_frac = max(fracs)
     if max_frac > 0.15:
         alert_status, emoji = "CRITICAL_BIFURCATION_ZONE", "🚨"
     elif max_frac > 0.05:
@@ -998,19 +1165,18 @@ def execute_adaptive_2026_monitor(model: OmegaBoxModel,
     else:
         alert_status, emoji = "NOMINAL_STABLE_LIMIT_CYCLE", "✅"
 
-    print("\n" + "=" * 70)
-    print("ADAPTIVE 2026 ENSO BIFURCATION EARLY WARNING MONITOR")
-    print("=" * 70)
-    print(f"  Date:      {current_date.strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  NOAA:      {observed_phase}")
-    print(f"  Active σ:  {active_sigma:.4f}   |   Active λ:  {active_lambda:.4f}")
+    print(f"  Active σ:    {active_sigma:.4f}   |   Active λ:  {active_lambda:.4f}")
     print("-" * 70)
-    print(f"  α_T^eff:   {dist['alpha_T_eff']:.4f}")
-    print(f"  σ_crit:    {dist['sigma_crit']:.4f}   |   λ_crit:    {dist['lambda_crit']:.4f}")
-    print(f"  d_σ:       {dist['d_sigma']:+.4f} ({f_sig:+.1%})")
-    print(f"  d_λ:       {dist['d_lambda']:+.4f} ({f_lam:+.1%})")
+    print(f"  α_T^eff:     {dist['alpha_T_eff']:.4f}")
+    if lam_in:
+        print(f"  σ_crit:      {dist['sigma_crit']:.4f}   |   λ_crit:    {dist['lambda_crit']:.4f}")
+        print(f"  d_λ:         {dist['d_lambda']:+.4f} ({f_lam:+.1%})")
+    else:
+        print(f"  σ_crit:      {dist['sigma_crit']:.4f}   |   λ_crit:    OUT OF RANGE (> 2.00 search bound)")
+        print(f"  d_λ:         n/a (λ_crit outside search range)")
+    print(f"  d_σ:         {dist['d_sigma']:+.4f} ({f_sig:+.1%})")
     print("-" * 70)
-    print(f"\n[{emoji} {alert_status}]")
+    print(f"\n[{emoji} {alert_status}]" + ("  [MOCK DATA]" if data_source == "mock" else ""))
     print("=" * 70)
     return {
         "timestamp": str(current_date),
@@ -1018,8 +1184,12 @@ def execute_adaptive_2026_monitor(model: OmegaBoxModel,
         "active_sigma": active_sigma,
         "active_lambda": active_lambda,
         "noaa_phase": observed_phase,
+        "data_source": data_source,
+        "feeds": {"oisst_ok": bool(live_metrics.get("oisst_ok")),
+                  "olr_ok": bool(live_metrics.get("olr_ok"))},
         "adaptive_thresholds": {"sigma_crit": dist["sigma_crit"],
                                 "lambda_crit": dist["lambda_crit"],
+                                "lambda_crit_in_range": lam_in,
                                 "alpha_T_eff": dist["alpha_T_eff"]},
         "distances": {"d_sigma": dist["d_sigma"], "d_lambda": dist["d_lambda"],
                       "frac_sigma": dist["frac_sigma"], "frac_lambda": dist["frac_lambda"]},
@@ -1067,7 +1237,8 @@ def plot_historical_timeline(timeline_data: dict, event_name: str = "Historical 
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig('/mnt/agents/output/historical_timeline.png', dpi=150)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        plt.savefig(os.path.join(OUTPUT_DIR, 'historical_timeline.png'), dpi=150)
         plt.show()
     except Exception as e:
         print(f"Visualization bypassed: {e}")
@@ -1168,11 +1339,12 @@ class WindyComExporter:
         self.dt = dt
         self.start_date = start_date or datetime.now()
         self.points: List[WindyPoint] = []
+        self._rng = np.random.default_rng(42)  # v1.7: seeded — exports are reproducible
         self._build_wind_field()
 
     def _phi_to_wind_anomaly(self, phi: float, base_tau: float) -> Tuple[float, float]:
         u_anom = base_tau * 25.0 + phi * 3.5
-        v_anom = -phi * 0.8 + np.random.normal(0, 0.3)
+        v_anom = -phi * 0.8 + self._rng.normal(0, 0.3)
         return u_anom, v_anom
 
     def _build_wind_field(self):
@@ -1220,7 +1392,7 @@ class WindyComExporter:
                 "title": "Ω-ENSO Wind Anomaly Prediction",
                 "source": "Ω-Box Model v1.4",
                 "generated": datetime.now().isoformat(),
-                "description": "Equatorial Pacific wind anomalies from Ω-ENSO framework"
+                "description": "Equatorial Pacific wind anomalies from Ω-ENSO framework. SYNTHETIC field: wind vectors are derived from model phi by fixed coefficients (u = 25*tau + 3.5*phi; v = -0.8*phi + seeded noise). They are not observed winds."
             },
             "features": features
         }
@@ -1637,6 +1809,23 @@ class MetaLearner:
         print(f"[Meta-Learning] Checkpoint saved: {filepath}")
 
 # =====================================================================
+# 17b. META-LEARNING DEMO (v1.7 — the --meta entry point called this
+# function in v1.6, where it did not exist; it runs a real, small
+# evolutionary search so the door is wired to the actual machinery)
+# =====================================================================
+def demo_meta_learning():
+    print("Ω-FRAMEWORK META-LEARNING — DEMONSTRATION RUN (small configuration)")
+    cfg = MetaConfig(pop_size=6, n_generations=5, episode_steps=600, seed=42)
+    learner = MetaLearner(config=cfg, base_params=OmegaParameters())
+    best = learner.train()
+    print("\nBest parameters (OmegaParameters form):")
+    for k in MetaLearner.META_KEYS:
+        print(f"  {k:15s} = {getattr(best, k):.6f}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    learner.save_checkpoint(os.path.join(OUTPUT_DIR, "meta_learning_checkpoint.json"))
+    return best
+
+# =====================================================================
 # 18. DEMO ADAPTIVE THRESHOLD (optional standalone)
 # =====================================================================
 def demo_adaptive_threshold_dynamics():
@@ -1731,7 +1920,7 @@ if __name__ == "__main__":
         demo_meta_learning()
         sys.exit(0)
 
-    print("Ω-FRAMEWORK ENSO — COMPLETE UNIFIED PRODUCTION SUITE (v1.6)")
+    print("Ω-FRAMEWORK ENSO — COMPLETE UNIFIED PRODUCTION SUITE (v1.7)")
     print("=" * 70)
 
     # 1. Core validation and live monitor
@@ -1754,9 +1943,17 @@ if __name__ == "__main__":
 
     # 3. Long-run projection using adaptive parameters
     print("\n--- Long-Duration Projections ---")
+    if adaptive_result.get("active_sigma") is None or adaptive_result.get("active_lambda") is None:
+        # v1.7: no live σ/λ exists (data incomplete). The trajectory
+        # below is a DEMO on default parameters, labeled as such —
+        # never a projection from measured data.
+        print("[DEMO TRAJECTORY — default parameters; no live σ/λ available]")
+        proj_sigma, proj_lam = OmegaParameters().sigma, OmegaParameters().lam
+    else:
+        proj_sigma, proj_lam = adaptive_result["active_sigma"], adaptive_result["active_lambda"]
     active_params = OmegaParameters(
-        sigma=adaptive_result["active_sigma"],
-        lam=adaptive_result["active_lambda"],
+        sigma=proj_sigma,
+        lam=proj_lam,
         A_force=0.03,
         T_force=48.0,
         noise_type="student_t"
@@ -1774,10 +1971,15 @@ if __name__ == "__main__":
         m_date = enso_1997_timeline["dates"][i]
         s_scale = enso_1997_timeline["sigma_scalers"][i]
         l_scale = enso_1997_timeline["lambda_scalers"][i]
-        active_sigma_1997 = 0.5567 * s_scale
-        active_lambda_1997 = 0.2656 * l_scale
-        print(f"Month: {m_date} | Active Sigma: {active_sigma_1997:.4f} | Active Lambda: {active_lambda_1997:.4f}")
-    plot_historical_timeline(enso_1997_timeline, "1997 Super El Niño Development")
+        # v1.7: a missing feed prints as NO DATA, never as a number.
+        sig_txt = f"{0.5567 * s_scale:.4f}" if s_scale is not None else "[NO DATA]"
+        lam_txt = f"{0.2656 * l_scale:.4f}" if l_scale is not None else "[NO DATA — OLR route OPEN]"
+        print(f"Month: {m_date} | Active Sigma: {sig_txt} | Active Lambda: {lam_txt}")
+    if all(v is not None for v in enso_1997_timeline["sigma_scalers"]) and \
+       all(v is not None for v in enso_1997_timeline["lambda_scalers"]):
+        plot_historical_timeline(enso_1997_timeline, "1997 Super El Niño Development")
+    else:
+        print("[Timeline plot skipped — one or more months have NO DATA]")
 
     # 5. Windy.com Export
     print("\n--- Windy.com Export ---")
